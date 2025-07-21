@@ -1,306 +1,77 @@
-# Entity Resolution Auto Loader Pipeline
-
-This notebook automatically loads data from S3 into Databricks tables using the following structure:
-
-```
-entity_resolution (Database)
-└── bronze (Schema)
-    ├── edm_entity
-    ├── edm_relationship
-    └── edm_attribute
-```
-
-This follows the pattern: database.schema.table_name (entity_resolution.bronze.edm_entity)
-
-The bronze layer contains raw data loaded directly from source files, following Databricks' best practices for data lakehouse architecture.
-
-**Important Note**: In Databricks:
-- Database and schema mean the same thing
-- Tables are accessed as: `catalog_name.database_name.table_name`
-- Example: `hive_metastore.your_database_name.customers`
-
-This notebook automatically:
-1. Loads files from S3 landing zone
-2. Identifies table names from file prefixes
-3. Loads data into appropriate Databricks tables
-4. Archives processed files
-
-## Features
-- Automatic table name detection from file prefixes
-- Multi-format support (CSV, JSON, Parquet)
-- Automatic schema evolution
-- File archiving after processing
-
 # Import required libraries
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
-import os
 from datetime import datetime
+import logging
+import json
+import os
 
-# Configuration
-configs = {
-    "s3_bucket": "your-bucket-name",    # Update this
-    "landing_zone": "landing-zone",
-    "archive_zone": "archive-zone",
-    "database": "entity_resolution",    # Database name
-    "schema": "bronze",                 # Schema name
-    "catalog_name": "hive_metastore"    # Default catalog in Databricks
-}
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('AutoLoaderPipeline')
 
-# Tables will be created as: entity_resolution.bronze.edm_entity
+# Pipeline Configuration
+class PipelineConfig:
+    def __init__(self):
+        self.configs = {
+            # S3 Paths
+            "landing_zone_path": "s3://bucket/autoloader/laxnding",
+            "archive_zone_path": "s3://bucket/autoloader/archive",
+            
+            # Database Configuration
+            "database": "entity_resolution",
+            "schema": "bronze",
+            "catalog_name": "hive_metastore",
+            
+            # Supported File Formats
+            "supported_formats": {
+                "csv": {"header": "true", "inferSchema": "true"},
+                "json": {"multiLine": "true"},
+                "parquet": {}
+            },
+            
+            # Entity Types
+            "entity_types": ["edm_entity", "edm_relationship", "edm_attribute"],
+            
+            # Auto Loader Options
+            "auto_loader_options": {
+                "cloudFiles.schemaEvolutionMode": "addNewColumns",
+                "cloudFiles.inferColumnTypes": "true",
+                "cloudFiles.schemaLocation": "/tmp/autoloader/schemas",
+                "cloudFiles.useIncrementalListing": "true"
+            }
+        }
+    
+    def get_landing_path(self, entity_type):
+        """Get the full S3 path for landing zone by entity type"""
+        return f"{self.configs['landing_zone_path']}/{entity_type}"
+    
+    def get_archive_path(self, entity_type, status="processed"):
+        """Get the full S3 path for archive zone by entity type and status"""
+        timestamp = datetime.now().strftime('%Y/%m/%d')
+        return f"{self.configs['archive_zone_path']}/{entity_type}/{status}/{timestamp}"
+    
+    def get_table_name(self, entity_type):
+        """Get the full table name including database and schema"""
+        return f"{self.configs['database']}.{self.configs['schema']}.{entity_type}"
 
-# Full path to tables will be: hive_metastore.main.bronze_customers
-# This follows the medallion architecture (bronze = raw data)
+# Initialize configuration
+config = PipelineConfig()
 
-# Note: In Databricks, database_name is the same as schema_name
-# Tables will be created as: catalog_name.database_name.table_name
-# Example: hive_metastore.your_database_name.customers
-
-# Create Spark session with S3 configs
+# Create Spark session with optimized configs
 spark = SparkSession.builder \
-    .appName("S3-AutoLoader") \
+    .appName("Entity-Resolution-AutoLoader") \
     .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
+    .config("spark.sql.streaming.checkpointLocation", "/tmp/autoloader/checkpoints") \
+    .config("spark.sql.streaming.metricsEnabled", "true") \
     .getOrCreate()
 
-print("✅ Configuration loaded successfully!")
-print(f"Target S3 bucket: {configs['s3_bucket']}")
-print(f"Landing zone: {configs['landing_zone']}")
-print(f"Archive zone: {configs['archive_zone']}")
-print(f"Database: {configs['database']}")
-
-print("\n⚠️ IMPORTANT: Update the 's3_bucket' value in the configs above!")
-
-# Function to extract table name from file name
-def get_table_name(file_path: str) -> str:
-    """Extract table name from file prefix."""
-    file_name = os.path.basename(file_path).lower()
-    
-    # Common prefixes to match
-    patterns = {
-        'customer': 'customers',
-        'order': 'orders',
-        'product': 'products',
-        'user': 'users',
-        'transaction': 'transactions',
-        'inventory': 'inventory',
-        'sales': 'sales'
-    }
-    
-    # Match prefix to table name
-    for prefix, table in patterns.items():
-        if file_name.startswith(prefix):
-            print(f"✅ Matched prefix '{prefix}' to table '{table}'")
-            return table
-    
-    # Default: use file name without extension as table name
-    table_name = os.path.splitext(file_name)[0]
-    print(f"ℹ️ Using filename as table: '{table_name}'")
-    return table_name
-
-# Function to load data into table
-def load_to_table(file_path: str, table_name: str) -> bool:
-    """Load file data into table with schema evolution."""
-    try:
-        # Detect file format
-        file_format = os.path.splitext(file_path)[1][1:].lower()
-        if file_format in ['txt', 'tsv']:
-            file_format = 'csv'
-            
-        # Read options for different formats
-        read_options = {
-            'csv': {
-                'header': 'true',
-                'inferSchema': 'true'
-            },
-            'json': {
-                'multiLine': 'true'
-            },
-            'parquet': {}
-        }
-        
-        print(f"📖 Reading {file_format} file: {file_path}")
-        
-        # Read the file
-        df = spark.read.format(file_format) \
-            .options(**read_options.get(file_format, {})) \
-            .load(file_path)
-            
-        # Add metadata columns
-        df = df.withColumn('source_file', lit(file_path)) \
-            .withColumn('processed_at', current_timestamp())
-            
-        print(f"📝 Loading {df.count():,} rows into table {table_name}")
-            
-        # Write to table with schema evolution
-        df.write \
-            .format('delta') \
-            .option('mergeSchema', 'true') \
-            .mode('append') \
-            .saveAsTable(f"{configs['database']}.{configs['schema']}.{table_name}")
-            
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error loading {file_path} to {table_name}: {str(e)}")
-        return False
-
-# Function to archive processed file
-def archive_file(file_path: str, success: bool = True) -> bool:
-    """Move processed file to archive location."""
-    try:
-        # Create archive path with timestamp
-        timestamp = datetime.now().strftime('%Y/%m/%d/%H')
-        status = 'processed' if success else 'failed'
-        file_name = os.path.basename(file_path)
-        
-        archive_path = f"s3://{configs['s3_bucket']}/{configs['archive_zone']}/{status}/{timestamp}/{file_name}"
-        
-        print(f"📦 Archiving to: {archive_path}")
-        
-        # Move file to archive
-        dbutils.fs.mv(file_path, archive_path)
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error archiving {file_path}: {str(e)}")
-        return False
-
-print("✅ Helper functions loaded successfully!")
-
-# Main processing function
-def process_landing_zone():
-    """Process all files in landing zone."""
-    # Get list of files
-    landing_path = f"s3://{configs['s3_bucket']}/{configs['landing_zone']}"
-    files = dbutils.fs.ls(landing_path)
-    
-    results = {
-        'processed': 0,
-        'failed': 0,
-        'tables': set()
-    }
-    
-    print(f"📂 Found {len(files)} files to process")
-    
-    # Process each file
-    for file_info in files:
-        file_path = file_info.path
-        print(f"\n📄 Processing: {file_path}")
-        
-        try:
-            # Get table name from file prefix
-            table_name = get_table_name(file_path)
-            print(f"📊 Target table: {table_name}")
-            
-            # Load data to table
-            if load_to_table(file_path, table_name):
-                print("✅ Data loaded successfully")
-                archive_file(file_path, True)
-                results['processed'] += 1
-                results['tables'].add(table_name)
-            else:
-                print("❌ Failed to load data")
-                archive_file(file_path, False)
-                results['failed'] += 1
-                
-        except Exception as e:
-            print(f"❌ Error processing {file_path}: {str(e)}")
-            archive_file(file_path, False)
-            results['failed'] += 1
-    
-    return results
-
-# Execute the pipeline
-print("🚀 Starting Auto Loader Pipeline...\n")
-
-# Create database and schema
-print(f"Creating database: {configs['database']}")
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {configs['database']}")
-
-print(f"\nCreating schema: {configs['database']}.{configs['schema']}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {configs['database']}.{configs['schema']}")
-
-# Show available databases and schemas
-print("\nAvailable databases:")
-spark.sql("SHOW DATABASES").show()
-
-print("\nAvailable schemas in database:")
-spark.sql(f"SHOW SCHEMAS IN {configs['database']}").show()
-
-# Show example table names that will be created
-print("\nExample table names that will be created:")
-tables = ['edm_entity', 'edm_relationship', 'edm_attribute']
-for table in tables:
-    print(f"- {configs['database']}.{configs['schema']}.{table}")
-
-# Show example SQL queries
-print("\nExample SQL to query tables:")
-print(f"USE {configs['database']}.{configs['schema']};")
-print(f"SELECT * FROM edm_entity;")
-print("\nOr with full path:")
-print(f"SELECT * FROM {configs['database']}.{configs['schema']}.edm_entity;")
-
-# Process files
-results = process_landing_zone()
-
-# Print summary
-print("\n=== Processing Summary ===")
-print(f"📊 Files Processed: {results['processed']}")
-print(f"❌ Files Failed: {results['failed']}")
-print(f"📚 Tables Updated: {', '.join(results['tables'])}")
-
-print("\n✨ Pipeline completed!")
-
-# Display table statistics
-print("=== Table Statistics ===")
-for table in results['tables']:
-    df = spark.table(f"{configs['database']}.{configs['schema']}.{table}")
-    count = df.count()
-    print(f"\n📊 {table}:")
-    print(f"  - Total rows: {count:,}")
-    print(f"  - Schema:")
-    df.printSchema()
-
-## How to Use This Notebook
-
-1. **Update Configuration**
-   - Set your S3 bucket name in the configs
-   - Adjust landing and archive zone paths if needed
-   - Set target database name
-
-2. **Prepare Your Files**
-   - Name files with appropriate prefixes (e.g., `customer_data.csv`, `order_info.json`)
-   - Upload files to S3 landing zone
-   - Supported formats: CSV, JSON, Parquet, TXT
-
-3. **Run the Notebook**
-   - Execute all cells in order
-   - Monitor the output for processing status
-   - Check table statistics at the end
-
-4. **Check Results**
-   - Verify data in target tables
-   - Check archive zone for processed files
-   - Review any failed files
-
-## File Naming Examples
-
-| File Name | Target Table | Format |
-|-----------|--------------|--------|
-| `customer_data.csv` | `customers` | CSV |
-| `order_info.json` | `orders` | JSON |
-| `product_catalog.parquet` | `products` | Parquet |
-| `user_list.txt` | `users` | CSV |
-| `transaction_log.csv` | `transactions` | CSV |
-
-## Troubleshooting
-
-If you encounter issues:
-1. Check S3 bucket permissions
-2. Verify file formats and naming
-3. Review error messages in the output
-4. Check archive zone for failed files
-
-
-
+# Log configuration
+logger.info("Configuration loaded successfully!")
+logger.info(f"Landing zone path: {config.configs['landing_zone_path']}")
+logger.info(f"Archive zone path: {config.configs['archive_zone_path']}")
+logger.info(f"Database: {config.configs['database']}")
+logger.info(f"Schema: {config.configs['schema']}")
+logger.info(f"Supported formats: {list(config.configs['supported_formats'].keys())}")
+logger.info(f"Entity types: {config.configs['entity_types']}")
