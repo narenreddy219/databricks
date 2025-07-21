@@ -1,49 +1,64 @@
-# ⚙️ Step 3–9: Batch Processing Logic (combined cleanly)
+from pyspark.sql.functions import input_file_name
+import os
+
 def process_batch(batch_df, batch_id):
+    """
+    Steps 3–9: Processes files in a micro-batch, routes by filename, loads into a Delta table,
+    and archives the file after successful ingestion.
+    Requires org_name, schema_name, and landing_path to be set in Cell 1.
+    """
+
+    # Pull base bucket from landing_path
+    # Example: s3://your-bucket/landing-zone/ → "your-bucket"
+    bucket = landing_path.replace("s3://", "").split("/")[0]
+
     paths = batch_df.select("path").rdd.map(lambda r: r[0]).collect()
 
     for path in paths:
         try:
             filename = os.path.basename(path)
             ext = os.path.splitext(filename)[1].lower().strip(".")
+            filename_lower = filename.lower()
 
-            # 🏷️ Step 4: Routing Rule
-            if "edm_entity" in filename.lower():
+            # 🧠 Step 4: Determine routing
+            if "edm_entity" in filename_lower:
                 table_name = "edm_entity"
             else:
                 print(f"❌ No routing rule for file: {filename}")
                 continue
 
+            # ✅ Use config variables from Cell 1
             target_table = f"{org_name}.bronze.{table_name}"
-            schema_tracking_path = f"s3://your-bucket/schema-tracking/{org_name}/{schema_name}/{table_name}/"
-            checkpoint_path = f"s3://your-bucket/checkpoints/{org_name}/{schema_name}/{table_name}/"
+            schema_tracking_path = f"s3://{bucket}/schema-tracking/{org_name}/{schema_name}/{table_name}/"
+            checkpoint_path = f"s3://{bucket}/checkpoints/{org_name}/{schema_name}/{table_name}/"
+
             print(f"🔍 Routing file: {filename} → Table: {target_table}")
 
-            # 📥 Step 5: Read File
+            # 📥 Step 5: Read file based on extension
             if ext in ["csv", "txt"]:
                 df = spark.read.option("header", "true").option("inferSchema", "true").csv(path)
             elif ext == "json":
                 df = spark.read.option("inferSchema", "true").json(path)
             else:
-                print(f"⚠️ Unsupported format: {filename}")
+                print(f"⚠️ Unsupported file format: {filename}")
                 continue
 
             df = df.withColumn("source_file", input_file_name())
 
-            # 🧱 Step 6: Validate Table
+            # 🧱 Step 6: Check if Delta table exists
             if not spark._jsparkSession.catalog().tableExists(target_table):
-                print(f"🚫 Table not found for {filename}. File remains in landing zone.")
+                print(f"🚫 Delta table not found: {target_table}. File left in landing zone.")
                 continue
 
-            # 💾 Step 7: Write to Table
+            # 💾 Step 7: Append to Delta table
             df.write.format("delta").mode("append").saveAsTable(target_table)
-            print(f"✅ Loaded into: {target_table}")
+            print(f"✅ Data appended to: {target_table}")
 
-            # 🗃️ Step 8: Archive the File
+            # 🗃️ Step 8: Archive the processed file
             archive_path = path.replace("landing-zone", "archive-zone")
             dbutils.fs.mv(path, archive_path)
             print(f"📦 Archived: {archive_path}")
 
         except Exception as e:
-            # ❌ Step 9: Handle Errors
+            # ❌ Step 9: Error Handling
             print(f"❌ Error processing {filename}: {e}")
