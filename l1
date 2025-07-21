@@ -1,0 +1,39 @@
+from pyspark.sql.functions import current_timestamp, lit
+
+# Config
+file_path = "s3://your-bucket/landing-zone/edm_entity1.csv"
+target_table = "default.temp_ingest_test"
+
+# Detect file format
+file_format = file_path.split('.')[-1].lower()
+
+# Read options
+options = {
+    "cloudFiles.format": file_format,
+    "cloudFiles.inferColumnTypes": "true",
+    "cloudFiles.schemaLocation": "/tmp/autoloader/test_table/schema"
+}
+
+# Format-specific tweaks
+if file_format == "csv":
+    options.update({"header": "true", "delimiter": ","})
+elif file_format == "txt":
+    options.update({"header": "true", "delimiter": "\t"})
+
+# Load file with Auto Loader
+df = (
+    spark.read
+    .format("cloudFiles")
+    .options(**options)
+    .load(file_path)
+    .withColumn("source_file", lit(file_path))
+    .withColumn("load_timestamp", current_timestamp())
+)
+
+# Write to Delta table (non-Unity Catalog)
+df.write.format("delta") \
+    .mode("append") \
+    .option("mergeSchema", "true") \
+    .saveAsTable(target_table)
+
+print(f"✅ File loaded into Delta table: {target_table}")
