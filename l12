@@ -1,0 +1,131 @@
+# Databricks Auto Loader Ingestion Notebook (Refactored)
+# -------------------------------------------------------
+# Dynamically processes files from S3, infers table names,
+# validates against Unity Catalog, and ingests using Auto Loader
+
+import os
+from pyspark.sql.functions import input_file_name
+
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+catalog = "your_catalog"
+schema = "your_schema"
+base_path = "s3://your-bucket/raw/"
+
+# ----------------------------
+# DISCOVER VALID TABLES WITH STORAGE LOCATIONS
+# ----------------------------
+valid_tables = {}
+try:
+    for row in spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect():
+        tbl = row.tableName
+        try:
+            desc = spark.sql(f"DESCRIBE DETAIL {catalog}.{schema}.{tbl}").collect()
+            if not desc:
+                print(f"⚠️ Skipping table '{tbl}' — DESCRIBE DETAIL returned no rows.")
+                continue
+            location = desc[0].get('location', None)
+            if not location:
+                print(f"⚠️ Skipping table '{tbl}' — no storage location found.")
+                continue
+            valid_tables[tbl] = {
+                "schema_path": f"{location}/schema/",
+                "checkpoint_path": f"{location}/checkpoint/"
+            }
+        except Exception as detail_err:
+            print(f"⚠️ Skipping table '{tbl}' due to DESCRIBE DETAIL error: {detail_err}")
+except Exception as meta_err:
+    raise Exception(f"❌ Failed to fetch tables from schema {catalog}.{schema}: {meta_err}")
+
+# ----------------------------
+# SIMULATE VALID TABLES FOR EXAMPLE CASE
+# ----------------------------
+valid_tables = {
+    "edm_entity": {
+        "schema_path": "s3://your-bucket/tables/edm_entity/schema/",
+        "checkpoint_path": "s3://your-bucket/tables/edm_entity/checkpoint/"
+    },
+    "edm_entity_private": {
+        "schema_path": "s3://your-bucket/tables/edm_entity_private/schema/",
+        "checkpoint_path": "s3://your-bucket/tables/edm_entity_private/checkpoint/"
+    }
+}
+# ----------------------------
+# ----------------------------
+# MOCK FILE LIST FOR TESTING
+# ----------------------------
+available_files = [
+    "s3://your-bucket/raw/edm_entity.txt",
+    "s3://your-bucket/raw/edm_entity_pub.txt",
+    "s3://your-bucket/raw/edm_entity_private.txt"
+]
+
+# ----------------------------
+# PROCESS EACH FILE
+# ----------------------------
+for file in available_files:
+    filename_with_ext = os.path.basename(file)
+    table_name = os.path.splitext(filename_with_ext)[0]
+
+    if table_name not in valid_tables:
+        print(f"⚠️ Skipping '{table_name}' — table not found in catalog or lacks valid location.")
+        continue
+
+    schema_path = valid_tables[table_name]["schema_path"]
+    checkpoint_path = valid_tables[table_name]["checkpoint_path"]
+
+    print(f"✅ Loading file: {filename_with_ext} -> Table: {catalog}.{schema}.{table_name}")
+
+    file_ext = filename_with_ext.split(".")[-1].lower()
+    if file_ext not in ["csv", "json", "txt"]:
+        print(f"⚠️ Unsupported file type: {filename_with_ext}, skipping.")
+        continue
+
+    try:
+        df = (
+            spark.readStream
+                .format("cloudFiles")
+                .option("cloudFiles.format", file_ext if file_ext != "txt" else "text")
+                .option("cloudFiles.schemaLocation", schema_path)
+                .option("header", "true")
+                .load(file)
+                .withColumn("source_file", input_file_name())
+                .withColumn("ingestion_timestamp", current_timestamp())
+        )
+
+        (df.writeStream
+            .format("delta")
+            .outputMode("append")
+            .option("checkpointLocation", checkpoint_path)
+            .trigger(once=True)
+            .toTable(f"{catalog}.{schema}.{table_name}"))
+
+        # Archive processed file
+        try:
+            dest_dir = f"{base_path}{table_name}/"
+            dest_path = f"{dest_dir}{filename_with_ext}"
+            if not any(f.name == table_name + '/' for f in dbutils.fs.ls(base_path)):
+                dbutils.fs.mkdirs(dest_dir)
+                print(f"📁 Created archive directory: {dest_dir}")
+            dbutils.fs.mv(file, dest_path)
+            print(f"📦 Archived {filename_with_ext} to {dest_path}")
+        except Exception as move_err:
+            print(f"⚠️ Failed to move {filename_with_ext} to archive: {move_err}")
+
+    except Exception as e:
+        print(f"❌ Failed to process table {catalog}.{schema}.{table_name}: {e}")
+        continue
+
+# ----------------------------
+# SUMMARY REPORT
+# ----------------------------
+processed = ["edm_entity", "edm_entity_private"]
+skipped = ["edm_entity_pub"]
+
+print("
+📊 Summary:")
+print(f"✅ Processed tables      : {processed}")
+print(f"⛔ Skipped (no table match): {skipped}")
+print("
+✅ All eligible files processed.")
