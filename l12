@@ -58,30 +58,31 @@ for file in available_files:
         skipped.append(table_name)
         continue
 
-    schema_path = f"{location}/schema/"
     checkpoint_path = f"{location}/checkpoint/"
 
     file_ext = filename_with_ext.split(".")[-1].lower()
-    df = (
-        spark.readStream
-            .format("cloudFiles")
-            .option("cloudFiles.format", file_ext if file_ext != "txt" else "text")
-            .option("cloudFiles.schemaLocation", schema_path)
-            .option("header", "true")
-            .load(file)
-            .withColumn("source_file", input_file_name())
-            .withColumn("ingestion_timestamp", current_timestamp())
-    )
-
-    df.writeStream 
-        .format("delta") 
-        .outputMode("append") 
-        .option("checkpointLocation", checkpoint_path) 
-        .trigger(once=True) 
-        .toTable(f"{catalog}.{schema}.{table_name}")
-
-    # Archive processed file
     try:
+        df = (
+            spark.readStream
+                .format("cloudFiles")
+                .option("cloudFiles.format", file_ext if file_ext != "txt" else "text")
+                .option("cloudFiles.schemaLocation", f"{location}/schema/")
+                .option("cloudFiles.inferColumnTypes", "true")
+                .option("header", "true")
+                .load(base_path)
+                .withColumn("source_file", input_file_name())
+                .withColumn("ingestion_timestamp", current_timestamp())
+                .withColumn("audit_id", lit(audit_id))
+        )
+
+        df.writeStream 
+            .format("delta") 
+            .outputMode("append") 
+            .option("checkpointLocation", checkpoint_path) 
+            .trigger(once=True) 
+            .toTable(f"{catalog}.{schema}.{table_name}")
+
+        # Archive processed file
         dest_dir = f"{base_path}{table_name}/"
         dest_path = f"{dest_dir}{filename_with_ext}"
         if not any(f.name == table_name + '/' for f in dbutils.fs.ls(base_path)):
@@ -90,8 +91,9 @@ for file in available_files:
         dbutils.fs.mv(file, dest_path)
         print(f"📦 Moved file from {file} to {dest_path}")
         processed.append(table_name)
-    except Exception as move_err:
-        print(f"⚠️ Failed to archive {filename_with_ext}: {move_err}")
+
+    except Exception as e:
+        print(f"❌ Failed to process file {filename_with_ext}: {e}")
         skipped.append(table_name)
         continue
 
