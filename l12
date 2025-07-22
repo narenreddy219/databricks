@@ -5,6 +5,13 @@
 import os
 from pyspark.sql.functions import input_file_name, current_timestamp
 
+import uuid
+from pyspark.sql.functions import lit
+
+audit_id = str(uuid.uuid4())
+
+audit_id = str(uuid.uuid4())
+
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
@@ -48,7 +55,7 @@ for file in available_files:
     # Fetch table location
     try:
         desc = spark.sql(f"DESCRIBE DETAIL {catalog}.{schema}.{table_name}").collect()
-        location = desc[0].get("location")
+        location = desc[0]["location"]
         if not location:
             print(f"⚠️ Skipping '{table_name}' — no location found.")
             skipped.append(table_name)
