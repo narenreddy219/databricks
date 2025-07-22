@@ -1,0 +1,103 @@
+# Databricks Auto Loader Ingestion Notebook
+# ------------------------------------------------------------
+# Dynamically maps S3 files to Delta tables by filename,
+# queries Unity Catalog to determine schema/checkpoint paths,
+# and processes only those with valid configurations.
+
+import os
+from pyspark.sql.functions import input_file_name
+
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+catalog = "your_catalog"
+schema = "your_schema"
+base_path = "s3://your-bucket/raw/"
+
+# ----------------------------
+# BUILD TABLE METADATA FROM UNITY CATALOG
+# ----------------------------
+try:
+    tables = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
+    table_metadata = {}
+    for row in tables:
+        tbl = row.tableName
+        desc = spark.sql(f"DESCRIBE DETAIL {catalog}.{schema}.{tbl}").collect()[0]
+        location = desc['location']
+
+        table_metadata[tbl] = {
+            "schema_path": f"{location}/schema/",
+            "checkpoint_path": f"{location}/checkpoint/"
+        }
+except Exception as meta_err:
+    raise Exception(f"❌ Failed to fetch table metadata from schema {catalog}.{schema}: {meta_err}")
+
+# ----------------------------
+# FETCH FILES FROM LANDING ZONE
+# ----------------------------
+try:
+    available_files = [f.path for f in dbutils.fs.ls(base_path) if not f.path.endswith("/")]
+except Exception as e:
+    raise Exception(f"❌ Failed to list files from {base_path}: {e}")
+
+# ----------------------------
+# PROCESS EACH FILE
+# ----------------------------
+for file in available_files:
+    filename_with_ext = os.path.basename(file)
+    table_name = os.path.splitext(filename_with_ext)[0]
+
+    if table_name not in table_metadata:
+        print(f"⚠️ Skipping '{table_name}' - no metadata entry found.")
+        continue
+
+    schema_path = table_metadata[table_name]["schema_path"]
+    checkpoint_path = table_metadata[table_name]["checkpoint_path"]
+
+    try:
+        dbutils.fs.ls(schema_path)
+    except Exception:
+        print(f"⚠️ Skipping '{table_name}' due to missing schema at {schema_path}")
+        continue
+
+    print(f"✅ Loading file: {filename_with_ext} -> Table: {catalog}.{schema}.{table_name}")
+
+    file_ext = filename_with_ext.split(".")[-1].lower()
+    if file_ext not in ["csv", "json", "txt"]:
+        print(f"⚠️ Unsupported file type: {filename_with_ext}, skipping.")
+        continue
+
+    df = (
+        spark.readStream
+            .format("cloudFiles")
+            .option("cloudFiles.format", file_ext if file_ext != "txt" else "text")
+            .option("cloudFiles.schemaLocation", schema_path)
+            .option("header", "true")
+            .load(file)
+            .withColumn("source_file", input_file_name())
+    )
+
+    try:
+        (df.writeStream
+            .format("delta")
+            .outputMode("append")
+            .option("checkpointLocation", checkpoint_path)
+            .trigger(once=True)
+            .toTable(f"{catalog}.{schema}.{table_name}"))
+
+        try:
+            dest_dir = f"{base_path}{table_name}/"
+            dest_path = f"{dest_dir}{filename_with_ext}"
+            if not any(f.name == table_name + '/' for f in dbutils.fs.ls(base_path)):
+                dbutils.fs.mkdirs(dest_dir)
+                print(f"📁 Created directory: {dest_dir}")
+            dbutils.fs.mv(file, dest_path)
+            print(f"📦 Archived {filename_with_ext} to {dest_path}")
+        except Exception as move_err:
+            print(f"⚠️ Failed to move {filename_with_ext}: {move_err}")
+
+    except Exception as e:
+        print(f"❌ Failed to write to {catalog}.{schema}.{table_name}: {e}")
+        continue
+
+print("\n✅ All files processed.")
