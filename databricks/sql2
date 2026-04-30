@@ -1,0 +1,24 @@
+WITH params AS (
+    SELECT
+        '<<RECONID>>' AS p_reconid,
+        'ALL'         AS p_env
+    FROM dual
+)
+SELECT
+    s.reconid,
+    s.env,
+    s.status,
+    s.triggertime,
+    s.daysofweek,
+    s.frequency,
+    s.last_trigger_cob_date,
+    s.okfile,
+    s.dpp_data_load_ind,
+    s.data_merge_ind,
+    s.created_ts,
+    s.modified_ts
+FROM FASTTRAC.OM_RECON_SCHEDULE s
+JOIN params p
+    ON s.reconid = p.p_reconid
+WHERE (p.p_env = 'ALL' OR s.env = p.p_env)
+ORDER BY s.env, s.reconid;

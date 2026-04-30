@@ -1,0 +1,63 @@
+WITH params AS (
+    SELECT
+        '<<RECONID>>' AS p_reconid,
+        'ALL'         AS p_env,
+        TRUNC(SYSDATE, 'IW')     AS week_start,
+        TRUNC(SYSDATE, 'IW') + 7 AS week_end
+    FROM dual
+)
+SELECT
+    source_table,
+    reconid,
+    env,
+    min_seen_ts,
+    max_seen_ts,
+    record_count
+FROM (
+    SELECT
+        'OM_RECON_DATAMERGE' AS source_table,
+        dm.reconid,
+        CAST(NULL AS VARCHAR2(50)) AS env,
+        MIN(dm.created_ts) AS min_seen_ts,
+        MAX(NVL(dm.modified_ts, dm.created_ts)) AS max_seen_ts,
+        COUNT(*) AS record_count
+    FROM FASTTRAC.OM_RECON_DATAMERGE dm
+    JOIN params p
+        ON dm.reconid = p.p_reconid
+    WHERE dm.created_ts >= p.week_start
+      AND dm.created_ts <  p.week_end
+    GROUP BY dm.reconid
+
+    UNION ALL
+
+    SELECT
+        'OM_RECON_MERGED_STATUS' AS source_table,
+        ms.reconid,
+        ms.env,
+        MIN(ms.merged_ts) AS min_seen_ts,
+        MAX(NVL(ms.modified_ts, ms.merged_ts)) AS max_seen_ts,
+        COUNT(*) AS record_count
+    FROM FASTTRAC.OM_RECON_MERGED_STATUS ms
+    JOIN params p
+        ON ms.reconid = p.p_reconid
+    WHERE ms.merged_ts >= p.week_start
+      AND ms.merged_ts <  p.week_end
+      AND (p.p_env = 'ALL' OR ms.env = p.p_env)
+    GROUP BY ms.reconid, ms.env
+
+    UNION ALL
+
+    SELECT
+        'OM_RECON_SCHEDULE' AS source_table,
+        s.reconid,
+        s.env,
+        MIN(s.created_ts) AS min_seen_ts,
+        MAX(NVL(s.modified_ts, s.created_ts)) AS max_seen_ts,
+        COUNT(*) AS record_count
+    FROM FASTTRAC.OM_RECON_SCHEDULE s
+    JOIN params p
+        ON s.reconid = p.p_reconid
+    WHERE (p.p_env = 'ALL' OR s.env = p.p_env)
+    GROUP BY s.reconid, s.env
+)
+ORDER BY source_table;

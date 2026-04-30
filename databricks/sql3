@@ -1,0 +1,130 @@
+The exact Oracle physical table names did not return results in the repository.
+
+Do a second-pass discovery using fuzzy search, config search, and column-name search.
+
+Context:
+This is a reconciliation pipeline using Oracle metadata DB, CDH/Hadoop/HDFS, and Apache Spark.
+Issue: This week there is around a 6-hour delay between Data Merger and Preprocessor pickup.
+
+The physical metadata tables are:
+- FASTTRAC.OM_RECON_DATAMERGE
+- FASTTRAC.OM_RECON_DATAMERGE_DETAIL
+- FASTTRAC.OM_RECON_MERGED_STATUS
+- FASTTRAC.OM_RECON_RUN_STATUS
+- FASTTRAC.OM_RECON_SCHEDULE
+- FASTTRAC.OM_RECON_SCHEDULE_CAL
+- FASTTRAC.RECONCILIATIONRUN
+
+But direct search for these table names returned no results.
+
+Please search the repo using these terms instead:
+
+1. Config keys / dynamic table names:
+- recon_schedule_table_name
+- dateflip_table_name
+- recon_conf_table_name
+- recon_rerun_table_name
+- schedule_table_name
+- dateflip
+- recon_conf
+- rerun_table
+- datamerge
+- data_merge
+- merged_status
+- recon_run_status
+- reconciliationrun
+- reconciliation_run
+
+2. Column names:
+- RECONID
+- reconid
+- TARGETFILENAME
+- targetfilename
+- FILECOUNT
+- filecount
+- FILEPATTERN
+- filepattern
+- MERGED_TS
+- merged_ts
+- ISMERGED
+- ismerged
+- ISSLA_BREACHED
+- issla_breached
+- TRIGGERED_COB_DATE
+- triggered_cob_date
+- MERGE_FEED_ID
+- merge_feed_id
+- LOADED_COUNT
+- loaded_count
+- SPARK_STATE
+- spark_state
+- SPARK_FINALSTATE
+- spark_finalstate
+- TRIGGERTIME
+- triggertime
+- DAYSOFWEEK
+- daysofweek
+- FREQUENCY
+- frequency
+- LAST_TRIGGER_COB_DATE
+- last_trigger_cob_date
+- DPP_DATA_LOAD_IND
+- dpp_data_load_ind
+- DATA_MERGE_IND
+- data_merge_ind
+
+3. Business/process terms:
+- merger
+- data merger
+- merge feed
+- preprocessor
+- preprocessing
+- preprocess
+- recon scheduler
+- scheduler
+- cob date
+- business date
+- okfile
+- control file
+- ready file
+- success file
+- _SUCCESS
+- SparkFinalState
+- Spark state
+- YARN
+- applicationId
+- application_id
+- jobid
+- job id
+- triggerid
+- loadid
+
+4. File types to inspect:
+- .properties
+- .conf
+- .yaml
+- .yml
+- .json
+- .xml
+- .sql
+- .scala
+- .java
+- .py
+- .sh
+- .ksh
+- .hql
+
+Tasks:
+1. Identify where Oracle metadata table names are configured.
+2. Identify where Data Merger reads schedule/config metadata.
+3. Identify where Data Merger writes or updates merge status.
+4. Identify where Preprocessor checks readiness or picks eligible recon runs.
+5. Identify any SQL, Spark DataFrame filters, JDBC reads/writes, or stored procedure calls.
+6. Identify any scheduler logic that filters by TRIGGERTIME, FREQUENCY, DAYSOFWEEK, ENV, TRIGGERED_COB_DATE, or LAST_TRIGGER_COB_DATE.
+7. Identify any code that uses ISMERGED, MERGED_TS, FILE_COUNT, LOADED_COUNT, ISSLA_BREACHED, or DATA_MERGE_IND.
+8. Identify whether the repo calls Oracle stored procedures/packages instead of direct table queries.
+9. Identify whether the actual logic is inside a packaged JAR, shell script, Oozie workflow, Airflow DAG, Autosys job, or Spark submit command.
+10. Return file path, method/function name, and matching lines for every relevant hit.
+
+Important:
+Do not stop because physical table names were not found. This repo may use dynamic table names, config-driven names, synonyms, views, or stored procedures.

@@ -1,0 +1,113 @@
+# Databricks Auto Loader Ingestion Notebook (Production Mode)
+# ------------------------------------------------------------
+# Actively ingests files from S3 into Delta tables using Auto Loader
+
+import os
+from pyspark.sql.functions import input_file_name, current_timestamp
+
+import uuid
+from pyspark.sql.functions import lit
+
+audit_id = str(uuid.uuid4())
+
+audit_id = str(uuid.uuid4())
+
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+catalog = "your_catalog"
+schema = "your_schema"
+base_path = "s3://your-bucket/raw/"
+
+# ----------------------------
+# FETCH VALID TABLE NAMES FROM CATALOG.SCHEMA
+# ----------------------------
+valid_table_names = set()
+try:
+    rows = spark.sql(f"SHOW TABLES IN {catalog}.{schema}").collect()
+    valid_table_names = {row.tableName for row in rows}
+except Exception as e:
+    raise Exception(f"❌ Failed to fetch tables from schema {catalog}.{schema}: {e}")
+
+# ----------------------------
+# LIST FILES FROM LANDING ZONE
+# ----------------------------
+try:
+    available_files = [f.path for f in dbutils.fs.ls(base_path) if not f.path.endswith("/")]
+except Exception as e:
+    raise Exception(f"❌ Failed to list files from {base_path}: {e}")
+
+# ----------------------------
+# PROCESS EACH FILE
+# ----------------------------
+processed = []
+skipped = []
+
+for file in available_files:
+    filename_with_ext = os.path.basename(file)
+    table_name = os.path.splitext(filename_with_ext)[0]
+
+    if table_name not in valid_table_names:
+        print(f"⚠️ Skipping '{table_name}' — table not found in catalog.")
+        skipped.append(table_name)
+        continue
+
+    # Fetch table location
+    try:
+        desc = spark.sql(f"DESCRIBE DETAIL {catalog}.{schema}.{table_name}").collect()
+        location = desc[0]["location"]
+        if not location:
+            print(f"⚠️ Skipping '{table_name}' — no location found.")
+            skipped.append(table_name)
+            continue
+    except Exception as e:
+        print(f"⚠️ Skipping '{table_name}' — error fetching table details: {e}")
+        skipped.append(table_name)
+        continue
+
+    checkpoint_path = f"{location}/checkpoint/"
+
+    file_ext = filename_with_ext.split(".")[-1].lower()
+    try:
+        df = (
+            spark.readStream
+                .format("cloudFiles")
+                .option("cloudFiles.format", file_ext if file_ext != "txt" else "text")
+                .option("cloudFiles.schemaLocation", f"{location}/schema/")
+                .option("cloudFiles.inferColumnTypes", "true")
+                .option("header", "true")
+                .load(base_path)
+                .withColumn("source_file", input_file_name())
+                .withColumn("ingestion_timestamp", current_timestamp())
+                .withColumn("audit_id", lit(audit_id))
+        )
+
+        df.writeStream 
+            .format("delta") 
+            .outputMode("append") 
+            .option("checkpointLocation", checkpoint_path) 
+            .trigger(once=True) 
+            .toTable(f"{catalog}.{schema}.{table_name}")
+
+        # Archive processed file
+        dest_dir = f"{base_path}{table_name}/"
+        dest_path = f"{dest_dir}{filename_with_ext}"
+        if not any(f.name == table_name + '/' for f in dbutils.fs.ls(base_path)):
+            dbutils.fs.mkdirs(dest_dir)
+            print(f"📁 Created archive directory: {dest_dir}")
+        dbutils.fs.mv(file, dest_path)
+        print(f"📦 Moved file from {file} to {dest_path}")
+        processed.append(table_name)
+
+    except Exception as e:
+        print(f"❌ Failed to process file {filename_with_ext}: {e}")
+        skipped.append(table_name)
+        continue
+
+# ----------------------------
+# SUMMARY REPORT
+# ----------------------------
+print("\n📊 Summary:")
+print(f"✅ Processed tables      : {sorted(set(processed))}")
+print(f"⛔ Skipped (no table match): {sorted(set(skipped))}")
+print("\n✅ All eligible files processed.")
