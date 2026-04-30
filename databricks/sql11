@@ -1,0 +1,40 @@
+WITH params AS (
+    SELECT
+        '8200065'  AS p_recon_id,
+        '20260427' AS p_cob_date
+    FROM dual
+),
+
+target_window AS (
+    SELECT
+        MIN(CASE
+                WHEN comp_nm = 'DataMerger'
+                 AND status = 'SUCCESS'
+                THEN start_time
+            END) AS datamerger_success_time,
+
+        MIN(CASE
+                WHEN comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+                 AND status = 'SUCCESS'
+                THEN start_time
+            END) AS preprocessor_success_time
+    FROM fasttrac.om_recon_audit_log a
+    JOIN params p
+        ON a.recon_id = p.p_recon_id
+    WHERE REPLACE(TO_CHAR(a.cob_date), '-', '') = p.p_cob_date
+)
+
+SELECT
+    a.comp_nm,
+    a.recon_id,
+    a.cob_date,
+    a.start_time,
+    a.status,
+    a.record_count,
+    a.message
+FROM fasttrac.om_recon_audit_log a
+CROSS JOIN target_window t
+WHERE a.comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+  AND a.start_time >= t.datamerger_success_time
+  AND a.start_time <= t.preprocessor_success_time
+ORDER BY a.start_time;
