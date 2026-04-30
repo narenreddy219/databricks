@@ -1,0 +1,30 @@
+WITH params AS (
+    SELECT
+        '<<RECONID>>' AS p_reconid,
+        TRUNC(SYSDATE, 'IW')     AS week_start,
+        TRUNC(SYSDATE, 'IW') + 7 AS week_end
+    FROM dual
+)
+SELECT
+    dm.reconid,
+    dm.triggered_cob_date,
+    dm.targetfilename,
+    dm.filecount,
+    dm.recon_sla,
+    dm.created_ts  AS datamerge_created_ts,
+    dm.modified_ts AS datamerge_modified_ts,
+
+    ROUND(
+        (
+            CAST(NVL(dm.modified_ts, dm.created_ts) AS DATE)
+            - CAST(dm.created_ts AS DATE)
+        ) * 24 * 60,
+        2
+    ) AS datamerge_metadata_duration_minutes
+
+FROM FASTTRAC.OM_RECON_DATAMERGE dm
+JOIN params p
+    ON dm.reconid = p.p_reconid
+WHERE dm.created_ts >= p.week_start
+  AND dm.created_ts <  p.week_end
+ORDER BY dm.created_ts;
