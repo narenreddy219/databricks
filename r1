@@ -1,0 +1,432 @@
+1. DPP application-level summary
+
+This tells whether the app itself had a surge.
+
+WITH dpp_rows AS (
+    SELECT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(cob_date)), '-', '') AS cob_date_key,
+        start_time,
+        status,
+        NVL(record_count, 0) AS record_count,
+        message
+    FROM fasttrac.om_recon_audit_log
+    WHERE comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND start_time >= TRUNC(SYSDATE, 'IW')
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+)
+
+SELECT
+    spark_application_id,
+
+    COUNT(*) AS dpp_file_load_rows,
+    COUNT(DISTINCT dpp_recon_id) AS distinct_recon_count,
+    COUNT(DISTINCT cob_date_key) AS distinct_cob_count,
+
+    SUM(record_count) AS total_dpp_record_count,
+    MAX(record_count) AS max_single_recon_record_count,
+
+    MIN(start_time) AS first_dpp_audit_time,
+    MAX(start_time) AS last_dpp_audit_time,
+
+    ROUND(
+        (CAST(MAX(start_time) AS DATE) - CAST(MIN(start_time) AS DATE)) * 24 * 60,
+        2
+    ) AS dpp_audit_span_minutes
+
+FROM dpp_rows
+GROUP BY spark_application_id
+ORDER BY
+    dpp_file_load_rows DESC,
+    total_dpp_record_count DESC;
+What this proves
+
+This directly answers:
+
+Was this DPP app unusually large?
+How many files/load events?
+How many recons?
+How many records?
+How long did audit logging span?
+
+For your finding, this should show something close to:
+
+143 DPP rows
+140 distinct recons
+
+That is the app-level surge evidence.
+
+2. Heavy contributors inside the same DPP app
+
+Use the target recon only to derive the Spark application ID, then rank every recon inside that same app.
+
+WITH target_app AS (
+    SELECT DISTINCT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id
+    FROM fasttrac.om_recon_audit_log
+    WHERE recon_id = '8200065'
+      AND REPLACE(TO_CHAR(cob_date), '-', '') = '20260427'
+      AND comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+),
+
+app_rows AS (
+    SELECT
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(a.recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '') AS cob_date_key,
+        a.start_time,
+        a.status,
+        NVL(a.record_count, 0) AS record_count,
+        a.message
+    FROM fasttrac.om_recon_audit_log a
+    JOIN target_app t
+        ON REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') = t.spark_application_id
+    WHERE a.comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+),
+
+ranked AS (
+    SELECT
+        spark_application_id,
+        dpp_recon_id,
+        cob_date_key,
+
+        COUNT(*) AS dpp_file_load_rows,
+        SUM(record_count) AS total_record_count,
+        MAX(record_count) AS max_record_count,
+
+        MIN(start_time) AS first_dpp_time,
+        MAX(start_time) AS last_dpp_time,
+
+        RANK() OVER (
+            ORDER BY SUM(record_count) DESC
+        ) AS record_volume_rank
+
+    FROM app_rows
+    GROUP BY
+        spark_application_id,
+        dpp_recon_id,
+        cob_date_key
+)
+
+SELECT
+    spark_application_id,
+    dpp_recon_id,
+    cob_date_key,
+    dpp_file_load_rows,
+    total_record_count,
+    max_record_count,
+    record_volume_rank,
+    first_dpp_time,
+    last_dpp_time
+FROM ranked
+ORDER BY
+    total_record_count DESC,
+    dpp_file_load_rows DESC;
+What this proves
+
+This gives the real heavy contributors from the DPP app.
+
+Your screenshot already shows top contributors like:
+
+713  → 24229 records
+72   → 23805 records
+765  → 22632 records
+755  → 20840 records
+290  → 20614 records
+
+So now the question is not:
+
+Why is merged_status null?
+
+The question is:
+
+What are recon IDs 713, 72, 765, 755, 290, etc.?
+Which feed/source files do they represent?
+3. Find recons with multiple file-load rows
+
+Since you found:
+
+143 files
+140 recons
+
+only a few recons likely had more than one DPP file/load event.
+
+WITH target_app AS (
+    SELECT DISTINCT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id
+    FROM fasttrac.om_recon_audit_log
+    WHERE recon_id = '8200065'
+      AND REPLACE(TO_CHAR(cob_date), '-', '') = '20260427'
+      AND comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+),
+
+app_rows AS (
+    SELECT
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(a.recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '') AS cob_date_key,
+        a.start_time,
+        NVL(a.record_count, 0) AS record_count,
+        a.message
+    FROM fasttrac.om_recon_audit_log a
+    JOIN target_app t
+        ON REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') = t.spark_application_id
+    WHERE a.comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+)
+
+SELECT
+    spark_application_id,
+    dpp_recon_id,
+    cob_date_key,
+    COUNT(*) AS dpp_file_load_rows,
+    SUM(record_count) AS total_record_count,
+    MIN(start_time) AS first_dpp_time,
+    MAX(start_time) AS last_dpp_time
+FROM app_rows
+GROUP BY
+    spark_application_id,
+    dpp_recon_id,
+    cob_date_key
+HAVING COUNT(*) > 1
+ORDER BY
+    dpp_file_load_rows DESC,
+    total_record_count DESC;
+What this proves
+
+This identifies which recons had multiple files in the same DPP application.
+
+If only three recons have COUNT(*) > 1, then the “143 files / 140 recons” gap is explained.
+
+4. Check whether these DPP recon IDs map to RECONCILIATIONRUN
+
+This is the next correction. The small IDs from your output likely map better to RECONCILIATIONRUN.RECONCILIATION_ID than to OM_RECON_MERGED_STATUS.RECONID.
+
+WITH target_app AS (
+    SELECT DISTINCT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id
+    FROM fasttrac.om_recon_audit_log
+    WHERE recon_id = '8200065'
+      AND REPLACE(TO_CHAR(cob_date), '-', '') = '20260427'
+      AND comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+),
+
+app_recons AS (
+    SELECT
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(a.recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '') AS cob_date_key,
+        MAX(NVL(a.record_count, 0)) AS dpp_record_count,
+        MIN(a.start_time) AS dpp_first_time,
+        MAX(a.start_time) AS dpp_last_time
+    FROM fasttrac.om_recon_audit_log a
+    JOIN target_app t
+        ON REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') = t.spark_application_id
+    WHERE a.comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+    GROUP BY
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+'),
+        TRIM(TO_CHAR(a.recon_id)),
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '')
+),
+
+rr_keys AS (
+    SELECT DISTINCT
+        TRIM(TO_CHAR(reconciliation_id)) AS reconciliation_id_key
+    FROM fasttrac.reconciliationrun
+),
+
+rr_id_keys AS (
+    SELECT DISTINCT
+        TRIM(TO_CHAR(id)) AS id_key
+    FROM fasttrac.reconciliationrun
+),
+
+schedule_keys AS (
+    SELECT DISTINCT
+        TRIM(TO_CHAR(reconid)) AS reconid_key
+    FROM fasttrac.om_recon_schedule
+),
+
+merged_status_keys AS (
+    SELECT DISTINCT
+        TRIM(TO_CHAR(reconid)) AS reconid_key
+    FROM fasttrac.om_recon_merged_status
+),
+
+metadata_comp_keys AS (
+    SELECT DISTINCT
+        TRIM(TO_CHAR(reconid)) AS reconid_key
+    FROM fasttrac.om_one_recon_meta_data_comp
+)
+
+SELECT
+    ar.dpp_recon_id,
+    ar.cob_date_key,
+    ar.dpp_record_count,
+    ar.dpp_first_time,
+    ar.dpp_last_time,
+
+    CASE WHEN rr.reconciliation_id_key IS NOT NULL THEN 'Y' ELSE 'N' END
+        AS maps_to_reconciliationrun_reconciliation_id,
+
+    CASE WHEN rrid.id_key IS NOT NULL THEN 'Y' ELSE 'N' END
+        AS maps_to_reconciliationrun_id,
+
+    CASE WHEN sch.reconid_key IS NOT NULL THEN 'Y' ELSE 'N' END
+        AS maps_to_om_recon_schedule_reconid,
+
+    CASE WHEN ms.reconid_key IS NOT NULL THEN 'Y' ELSE 'N' END
+        AS maps_to_om_recon_merged_status_reconid,
+
+    CASE WHEN mdc.reconid_key IS NOT NULL THEN 'Y' ELSE 'N' END
+        AS maps_to_meta_data_comp_reconid
+
+FROM app_recons ar
+LEFT JOIN rr_keys rr
+    ON rr.reconciliation_id_key = ar.dpp_recon_id
+LEFT JOIN rr_id_keys rrid
+    ON rrid.id_key = ar.dpp_recon_id
+LEFT JOIN schedule_keys sch
+    ON sch.reconid_key = ar.dpp_recon_id
+LEFT JOIN merged_status_keys ms
+    ON ms.reconid_key = ar.dpp_recon_id
+LEFT JOIN metadata_comp_keys mdc
+    ON mdc.reconid_key = ar.dpp_recon_id
+
+ORDER BY
+    ar.dpp_record_count DESC;
+What this proves
+
+This tells us what the DPP audit recon_id actually means.
+
+Based on your output, I expect many of the small IDs like 713, 72, 765 to not map to OM_RECON_MERGED_STATUS.RECONID.
+
+They may map to:
+
+RECONCILIATIONRUN.RECONCILIATION_ID
+
+or another config table ID.
+
+5. If they map to RECONCILIATIONRUN.RECONCILIATION_ID, get source/feed files
+
+Run this after Query 4.
+
+WITH target_app AS (
+    SELECT DISTINCT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id
+    FROM fasttrac.om_recon_audit_log
+    WHERE recon_id = '8200065'
+      AND REPLACE(TO_CHAR(cob_date), '-', '') = '20260427'
+      AND comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+),
+
+app_recons AS (
+    SELECT
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(a.recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '') AS cob_date_key,
+        MAX(NVL(a.record_count, 0)) AS dpp_record_count,
+        MIN(a.start_time) AS dpp_first_time,
+        MAX(a.start_time) AS dpp_last_time
+    FROM fasttrac.om_recon_audit_log a
+    JOIN target_app t
+        ON REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+') = t.spark_application_id
+    WHERE a.comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+    GROUP BY
+        REGEXP_SUBSTR(a.message, 'application_[0-9]+_[0-9]+'),
+        TRIM(TO_CHAR(a.recon_id)),
+        REPLACE(TRIM(TO_CHAR(a.cob_date)), '-', '')
+)
+
+SELECT
+    ar.spark_application_id,
+    ar.dpp_recon_id,
+    ar.cob_date_key,
+    ar.dpp_record_count,
+    ar.dpp_first_time,
+    ar.dpp_last_time,
+
+    rr.id AS reconciliationrun_id,
+    rr.reconciliation_id,
+    rr.reconname,
+    rr.recontype,
+    rr.runstatus,
+    rr.starttime AS reconengine_starttime,
+    rr.endtime AS reconengine_endtime,
+
+    rr.leftsrcfile,
+    rr.rightsrcfile,
+    rr.leftrecordcount,
+    rr.rightrecordcount,
+    rr.loadid,
+    rr.triggerid,
+    rr.message
+
+FROM app_recons ar
+LEFT JOIN fasttrac.reconciliationrun rr
+    ON TRIM(TO_CHAR(rr.reconciliation_id)) = ar.dpp_recon_id
+   AND rr.starttime >= ar.dpp_first_time
+   AND rr.starttime <  ar.dpp_first_time + INTERVAL '12' HOUR
+
+ORDER BY
+    ar.dpp_record_count DESC,
+    rr.starttime;
+What this proves
+
+This gives feed/source-file level clues without relying on OM_RECON_MERGED_STATUS.
+
+Look for:
+
+LEFTSRCFILE
+RIGHTSRCFILE
+LEFTRECORDCOUNT
+RIGHTRECORDCOUNT
+RECONNAME
+RECONTYPE
+
+This is likely where you will identify the real heavy contributor.
+
+6. App-level audit volume baseline
+
+This helps prove whether the app with 143 files / 140 recons was abnormal compared to other DPP apps.
+
+WITH dpp_rows AS (
+    SELECT
+        REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') AS spark_application_id,
+        TRIM(TO_CHAR(recon_id)) AS dpp_recon_id,
+        REPLACE(TRIM(TO_CHAR(cob_date)), '-', '') AS cob_date_key,
+        start_time,
+        NVL(record_count, 0) AS record_count,
+        message
+    FROM fasttrac.om_recon_audit_log
+    WHERE comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+      AND start_time >= TRUNC(SYSDATE, 'IW') - 7
+      AND REGEXP_SUBSTR(message, 'application_[0-9]+_[0-9]+') IS NOT NULL
+)
+
+SELECT
+    spark_application_id,
+
+    COUNT(*) AS dpp_file_load_rows,
+    COUNT(DISTINCT dpp_recon_id) AS distinct_recon_count,
+    SUM(record_count) AS total_record_count,
+    MAX(record_count) AS max_single_recon_record_count,
+
+    MIN(start_time) AS first_dpp_time,
+    MAX(start_time) AS last_dpp_time,
+
+    ROUND(
+        (CAST(MAX(start_time) AS DATE) - CAST(MIN(start_time) AS DATE)) * 24 * 60,
+        2
+    ) AS dpp_audit_span_minutes
+
+FROM dpp_rows
+GROUP BY spark_application_id
+ORDER BY
+    dpp_file_load_rows DESC,
+    distinct_recon_count DESC,
+    total_record_count DESC;
