@@ -405,3 +405,50 @@ spark.yarn.executor.memoryOverhead
 spark.executor.memoryOverhead
 spark.submit.deployMode
 spark.yarn.queue
+
+
+
+
+Analyze how CPP/DataPreProcessor requests Spark/YARN memory and executors.
+
+Context:
+We are adding a file pickup limit of 60 files per CPP application run. This limits how many files one CPP app owns, but we also need to understand how much memory/resources the CPP Spark application asks from YARN.
+
+Please search the repository for:
+- spark.executor.instances
+- spark.dynamicAllocation.enabled
+- spark.dynamicAllocation.minExecutors
+- spark.dynamicAllocation.initialExecutors
+- spark.dynamicAllocation.maxExecutors
+- spark.executor.memory
+- spark.executor.cores
+- spark.driver.memory
+- spark.yarn.executor.memoryOverhead
+- spark.executor.memoryOverhead
+- spark.yarn.queue
+- spark-submit
+- num-executors
+- executor-memory
+- executor-cores
+- driver-memory
+- parallel_batch_size
+- CorePreProcessor
+- DataPreProcessor
+- CPP
+
+Questions to answer:
+1. Where is CPP/DataPreProcessor Spark config defined?
+2. Is executor count fixed or dynamic?
+3. Is CPP currently starting with minimum 5 executors?
+4. What is executor memory?
+5. What is executor cores?
+6. What is driver memory?
+7. What YARN queue does CPP use?
+8. Does CPP use dynamic allocation?
+9. If dynamic allocation is enabled, what are minExecutors, initialExecutors, and maxExecutors?
+10. Does setting file pickup limit to 60 reduce memory requested at app startup, or only reduce workload size?
+11. Where should we change executor behavior so CPP does not demand 5 executors / ~200 GB upfront?
+12. What code/config files need to change?
+
+Important:
+Do not modify code yet. First provide file paths, config keys, current values, and explanation.
