@@ -1,0 +1,383 @@
+We need to implement Phase 1 controlled peak-mode file pickup for CPP/DataPreProcessor.
+
+Please analyze the repository first. Do not assume file names. Locate the correct CPP/DataPreProcessor entry point, existing file listing logic, config loading logic, HDFS file movement utilities, existing archive/failure handling, current parallel processing logic, and exact processFile invocation.
+
+Business context:
+CPP/DataPreProcessor is triggered by AutoSys every 15 minutes. During normal load, current behavior is acceptable. The problem happens during peak volume when hundreds of files land in the input directory, for example around 2 AM. Today CPP may pick hundreds of files in one Spark application, causing long-running Spark applications.
+
+Phase 1 goal:
+Keep the existing CPP processing, transformation, archive, success, failure, audit, and parallel logic unchanged as much as possible.
+
+The only intended change:
+During peak mode, CPP should limit the number of files picked by one application run and prevent duplicate pickup by moving selected files to a temporary runtime processing directory before processing.
+
+Final design:
+
+1. CPP starts and lists files from the normal input/pending directory as it does today.
+
+2. CPP counts total pending files.
+
+3. If totalPendingFiles <= 60:
+   - This is NORMAL MODE.
+   - Continue existing CPP process exactly as today.
+   - Do not create _peak_mode_processing directory.
+   - Do not rename/move files before processing.
+   - Do not change processFile behavior.
+   - Do not change archive/failure/success behavior.
+
+4. If totalPendingFiles > 60:
+   - This is PEAK MODE.
+   - Select only the first 60 files from the normal input/pending directory.
+   - Create a temporary runtime directory under the same input directory:
+     <input_dir>/_peak_mode_processing/<application_id_or_run_id>/
+   - Move/rename only those selected 60 files into this runtime directory.
+   - Process only files that were successfully moved/renamed.
+   - Leave all remaining files in the original input/pending directory for the next AutoSys CPP trigger.
+   - After processing, allow the existing CPP archive/success/failure logic to run exactly as it does today.
+   - After existing archive/failure handling completes, delete only the current application-specific runtime directory if it is empty.
+
+Important design decisions:
+- Do not group by recon_id.
+- Do not group by file pattern.
+- Do not preserve recon boundary.
+- Do not implement oversized recon logic.
+- Do not create internal sequential batches.
+- Do not process all pending files in batches inside the same Spark application.
+- Do not launch extra Spark jobs.
+- Do not change AutoSys.
+- Do not change Spark executor config.
+- Do not add Oracle/global config changes yet.
+- Do not modify ConfigBuilder yet.
+- Preserve existing processFile(...) call and arguments as much as possible.
+- Preserve existing parallel_batch_size / ForkJoinPool behavior.
+- Peak mode should only affect file pickup and temporary file location before processing.
+
+Why HDFS rename is used:
+File eligibility/status is managed through HDFS file operations, not a DB file-status table. Therefore, duplicate prevention should be done using HDFS rename/move.
+
+Duplicate prevention requirement:
+- In peak mode, selected files are moved out of the input directory before processing.
+- The next CPP trigger should list only the normal input/pending directory.
+- Since previously selected files are now under _peak_mode_processing/<application_id>, the next trigger should not pick them.
+- If another overlapping CPP application already moved a file, HDFS rename should fail. Log the failure and skip that file.
+- Only successfully renamed files should be processed.
+
+Directory behavior:
+
+Normal input directory example:
+<data_input_path>/
+
+Peak runtime directory example:
+<data_input_path>/_peak_mode_processing/<application_id>/
+
+Example:
+Before peak claim:
+<data_input_path>/file1.dat
+<data_input_path>/file2.dat
+
+After peak claim:
+<data_input_path>/_peak_mode_processing/application_123/file1.dat
+<data_input_path>/_peak_mode_processing/application_123/file2.dat
+
+Important:
+- File listing must exclude _peak_mode_processing and any subdirectories.
+- Normal mode must not create or use _peak_mode_processing.
+- Runtime directory must be application/run specific.
+- HDFS rename should happen within the same input parent directory where possible.
+- Do not delete the parent _peak_mode_processing directory if other application subdirectories exist.
+- Delete only:
+  <input_dir>/_peak_mode_processing/<current_application_id>/
+  and only after it is empty.
+
+Archive/failure handling requirement:
+Do not implement a separate archive flow for peak mode.
+
+After files are moved into:
+<input_dir>/_peak_mode_processing/<application_id>/
+
+CPP should process them using the same existing processFile and archive/success/failure handling used in normal mode.
+
+Peak mode should not change:
+- archive destination
+- success handling
+- failure handling
+- retry handling
+- audit behavior
+- transformation logic
+- processFile business logic
+
+If existing archive logic depends on the file path, update only the input file path passed to the existing logic so it processes/archives the moved file correctly from the runtime processing directory.
+
+Do not manually delete processed files before existing archive/failure logic runs.
+
+Config:
+Do not add Oracle/global config yet. Use safe defaults through existing commonProperties/global config if available.
+
+Add/read these keys with defaults:
+- cpp.file.pickup.limit.enabled = true
+- cpp.max.files.per.run = 60
+- cpp.peak.processing.dir.name = _peak_mode_processing
+
+Existing parallelism:
+Keep existing key/behavior:
+- parallel_batch_size
+- ForkJoinPool
+- ForkJoinTaskSupport
+- .par processing
+
+Example config read:
+val filePickupLimitEnabled =
+  commonProperties.getOrElse("cpp.file.pickup.limit.enabled", "true").toBoolean
+
+val maxFilesPerRun =
+  commonProperties.getOrElse("cpp.max.files.per.run", "60").toInt
+
+val peakProcessingDirName =
+  commonProperties.getOrElse("cpp.peak.processing.dir.name", "_peak_mode_processing")
+
+Implementation steps:
+
+Step 1: Locate existing code
+Search for:
+- DataPreProcessor
+- CorePreProcessor
+- CPP
+- processFile
+- fileConfigWithSideDF
+- input path
+- source path
+- file_name
+- filename
+- path
+- hdfs move
+- hdfs rename
+- archive
+- failure
+- success
+- processing
+- in_progress
+- temp
+- parallel_batch_size
+- ForkJoinPool
+- ForkJoinTaskSupport
+- .par
+- commonProperties
+- global.conf
+- ConfigFactory
+- application_id
+- run_id
+
+Step 2: Identify current file listing
+Find where CPP builds the collection/DataFrame/Seq of pending files, likely something similar to:
+val fileRowsSeq = fileConfigWithSideDF.collect().toSeq
+
+Step 3: Add mode decision after file listing
+val totalPendingFiles = fileRowsSeq.size
+
+val isPeakMode =
+  filePickupLimitEnabled && totalPendingFiles > maxFilesPerRun
+
+Behavior:
+- If isPeakMode=false:
+  selectedRows = fileRowsSeq
+  run existing logic unchanged
+- If isPeakMode=true:
+  candidateRows = fileRowsSeq.take(maxFilesPerRun)
+  rename/claim candidate rows into runtime directory
+  selectedRows = only successfully renamed rows
+  run existing logic only on selectedRows
+
+Step 4: Normal mode must remain unchanged
+When totalPendingFiles <= 60:
+- Do not create runtime directory.
+- Do not rename files.
+- Do not alter file paths.
+- Continue existing logic exactly as today.
+
+Step 5: Peak mode HDFS claim/rename
+In peak mode only:
+For each candidate row:
+1. Determine original source path from existing row/current logic.
+2. Determine file name.
+3. Build runtime directory:
+   <input_dir>/_peak_mode_processing/<application_id_or_run_id>/
+4. Create runtime directory if needed.
+5. Rename/move:
+   sourcePath -> runtimePath
+6. If rename succeeds:
+   - update/create row so existing processFile reads from runtimePath.
+   - include this row in selectedRowsForProcessing.
+7. If rename fails:
+   - log warning.
+   - skip that file.
+   - do not process it.
+
+Only selectedRowsForProcessing should be passed to the existing parallel processing block.
+
+Step 6: Preserve existing processing
+After selectedRows is determined:
+- Use the exact existing parallel processing logic.
+- Use selectedRows instead of original fileRowsSeq.
+- Preserve existing processFile(...) call and arguments as much as possible.
+- If processFile gets file path from row, update only that row/path to point to the runtime path.
+
+Step 7: Cleanup
+After existing processing and existing archive/failure handling finishes:
+- Delete only the current runtime directory:
+  <input_dir>/_peak_mode_processing/<current_application_id>/
+- Delete it only if empty.
+- If cleanup fails, log a warning but do not fail the whole job.
+- Do not delete the parent _peak_mode_processing folder if other app directories exist.
+- Do not delete files manually before archive/failure handling.
+
+Step 8: File listing exclusion
+Ensure the file listing logic excludes:
+- _peak_mode_processing
+- subdirectories
+- archive/success/error directories if applicable today
+
+CPP should list only actual pending input files from the normal input directory.
+
+Step 9: Logging
+Use the project logger, not println if logger exists.
+
+Normal mode logs:
+[CPP] totalPendingFiles=<count>
+[CPP] filePickupLimitEnabled=<true/false>
+[CPP] maxFilesPerRun=60
+[CPP] isPeakMode=false
+[CPP] Normal mode. Existing processing will continue without peak rename.
+
+Peak mode logs:
+[CPP] totalPendingFiles=<count>
+[CPP] filePickupLimitEnabled=true
+[CPP] maxFilesPerRun=60
+[CPP] isPeakMode=true
+[CPP] candidateFiles=60
+[CPP] runtimeProcessingPath=<input_dir>/_peak_mode_processing/<application_id>
+[CPP] claimStartTime=<timestamp>
+[CPP] claimEndTime=<timestamp>
+[CPP] claimDurationSeconds=<seconds>
+[CPP] successfullyRenamedFiles=<count>
+[CPP] failedRenameFiles=<count>
+[CPP] selectedFilesForProcessing=<count>
+[CPP] remainingFiles=<totalPendingFiles - candidateFiles>
+[CPP] Processing only successfully renamed files.
+[CPP] Remaining files will stay in input path for next trigger.
+
+Cleanup logs:
+[CPP] Cleaning peak runtime directory=<path>
+[CPP] Peak runtime directory cleanup completed
+or
+[CPP] Peak runtime directory cleanup skipped/failed, warning=<message>
+
+Step 10: Timing evidence
+Add timing around the HDFS rename/claim step:
+- claimStartTime
+- claimEndTime
+- claimDurationSeconds
+- candidateFiles
+- renamedFiles
+- failedRenameFiles
+
+This helps prove whether HDFS rename overhead is acceptable for 60 files.
+
+Step 11: Crash recovery analysis
+Do not fully implement recovery unless existing logic already exists.
+
+Analyze whether existing code has cleanup/recovery for files under processing/in-progress paths.
+
+If no recovery exists, document follow-up:
+- A stale runtime cleanup job may be needed.
+- If files remain under _peak_mode_processing/<application_id> older than configurable timeout, support should move them back to input/retry or alert.
+- Default proposed timeout: 60 minutes.
+
+Acceptance criteria:
+
+1. totalPendingFiles = 30:
+   - isPeakMode=false
+   - no _peak_mode_processing directory created
+   - no rename
+   - existing behavior unchanged
+   - 30 files processed
+
+2. totalPendingFiles = 60:
+   - isPeakMode=false
+   - no _peak_mode_processing directory created
+   - no rename
+   - existing behavior unchanged
+   - 60 files processed
+
+3. totalPendingFiles = 61:
+   - isPeakMode=true
+   - candidateFiles=60
+   - create _peak_mode_processing/<application_id>
+   - rename only 60 files
+   - process only successfully renamed files
+   - 1 file remains in input path
+
+4. totalPendingFiles = 500:
+   - isPeakMode=true
+   - candidateFiles=60
+   - create runtime directory
+   - rename only 60 files
+   - process only successfully renamed files
+   - 440 files remain in input path
+
+5. Duplicate prevention:
+   - Files moved to runtime processing path are not visible to next input directory listing.
+   - If rename fails because source no longer exists, skip and log.
+   - Next CPP trigger picks only remaining files in input path.
+
+6. Archive/failure:
+   - Existing archive/success/failure handling is reused.
+   - Peak mode does not create a new archive flow.
+   - Runtime directory is deleted only after existing handling completes and only if empty.
+
+7. Existing processing:
+   - Existing processFile(...) call and arguments are preserved as much as possible.
+   - Existing parallel_batch_size/ForkJoinPool behavior is preserved for selected/renamed rows.
+   - No internal sequential batching is added.
+   - No extra Spark jobs are launched.
+
+8. Code compiles.
+
+Testing/evidence:
+Please provide local/unit-test style validation or a small test harness if possible.
+
+Test scenarios:
+- 30 files -> normal mode, no rename
+- 60 files -> normal mode, no rename
+- 61 files -> peak mode, 60 candidate files, 1 remaining
+- 500 files -> peak mode, 60 candidate files, 440 remaining
+- Simulated rename failure -> file skipped, not processed
+- Runtime directory cleanup -> deletes only current app directory if empty
+
+Deliverables:
+1. Files/classes/methods changed.
+2. Exact code diff.
+3. Where totalPendingFiles is calculated.
+4. Where normal vs peak mode decision happens.
+5. Where selected 60 files are chosen.
+6. Where HDFS rename/claim happens.
+7. How row/path is updated after rename.
+8. Where selectedRows are passed to existing parallel processing.
+9. How duplicate pickup is prevented.
+10. What happens if rename fails.
+11. How normal archive behavior is preserved.
+12. How runtime directory cleanup works.
+13. What happens if CPP crashes after rename.
+14. Local testing evidence/log examples.
+15. Compile result.
+
+Do not implement:
+- Oracle/global config insert
+- ConfigBuilder change
+- Spark executor tuning
+- AutoSys frequency change
+- dynamic allocation change
+- program-driven autoscaling
+- recon grouping
+- file-pattern grouping
+- internal sequential batching
+- multiple Spark app launches
