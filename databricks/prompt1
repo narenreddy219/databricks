@@ -1,0 +1,391 @@
+We need to design and implement a controlled peak-mode file pickup strategy for CPP/DataPreProcessor.
+
+Please analyze the repository first. Do not assume exact file names. Locate the correct CPP/DataPreProcessor entry point, file listing logic, config loading logic, current parallel processing logic, and the exact processFile invocation.
+
+Context:
+CPP/DataPreProcessor is currently triggered by AutoSys every 15 minutes. Daily average volume is around 1,200 files, which is manageable across a full day. The issue is not the daily average. The issue is burst/peak volume, especially when hundreds of files land around peak windows such as 2 AM. When CPP picks hundreds of files in one Spark application, that application becomes long-running and can run for hours.
+
+Current known behavior:
+- CPP lists eligible/pending files.
+- CPP can pick a large number of files in one run.
+- CPP uses Scala parallel collections / ForkJoinPool.
+- Existing parallelism is controlled by something like `parallel_batch_size`, usually around 10.
+- ForkJoinPool is driver-side parallelism and uses work stealing. It is not strict FIFO and not a fair scheduler.
+- Even with 10 threads, throughput is limited by shared Spark driver, SparkSession, SparkContext, YARN executors, HDFS I/O, audit/database/Kafka logging, and resource availability.
+- Therefore, increasing thread count alone is not the right fix.
+
+Main design goal:
+Do NOT let one CPP Spark application pick/own hundreds of files during peak.
+
+Instead:
+- Normal load: keep current CPP behavior unchanged.
+- Peak load: CPP should pick only a limited recon-aware file set for the current run, process it, and exit.
+- The next AutoSys trigger will pick the next eligible limited file set.
+- Later, this can be extended to program-driven or 5-minute peak triggers, but do not implement that now.
+
+Important design clarification:
+This is NOT internal sequential batching of all files inside one Spark application.
+
+Bad design:
+- CPP sees 500 files.
+- CPP creates 30-file batches internally.
+- Same CPP application processes Batch 1, Batch 2, Batch 3, ..., until all 500 files finish.
+
+Do NOT implement this.
+
+Correct design:
+- CPP sees 500 files.
+- Peak mode activates because pending files > 30.
+- CPP selects only one recon-aware set of files for the current run, target max 30 files.
+- CPP processes only those selected files.
+- CPP exits.
+- Remaining files stay pending for the next trigger.
+
+Business rules:
+
+1. Peak threshold:
+   - If total pending files <= 30, normal mode.
+   - If total pending files > 30, peak mode.
+
+2. File cap:
+   - In peak mode, target max files per CPP run = 30.
+   - The cap is file-based, not recon-count-based.
+   - There is no fixed max recon count.
+   - If each recon has 1 file, the run can include 30 recons.
+   - If each recon has 2 files, the run can include around 15 recons.
+   - If one recon has 10 files, it counts as 10 files.
+
+3. Preserve recon boundary:
+   - Do not split one recon across multiple CPP runs.
+   - Group pending files by recon_id.
+   - Select recon groups until adding the next recon group would exceed max_files_per_run.
+   - Leave that next recon group for the next trigger.
+
+4. Oversized recon:
+   - If one recon itself has more than max_files_per_run files, process that entire recon as one oversized batch/run.
+   - Example: max_files_per_run=30 and Recon A has 50 files.
+   - Process Recon A with all 50 files in one run.
+   - Do not split Recon A into 30 + 20.
+   - This is the only case where selected file count can exceed max_files_per_run.
+
+5. Deterministic ordering:
+   - Preserve existing file/recon order as much as possible.
+   - Prefer ordering by existing file listing order, created_time, file timestamp, or whatever the current logic uses.
+   - Do not randomly reorder recons.
+   - If needed, use earliest row order per recon.
+
+Examples:
+
+Example 1:
+pending files > 30, max_files_per_run=30
+
+Recon 1 = 25 files
+Recon 2 = 4 files
+Recon 3 = 10 files
+
+Expected selected current run:
+Recon 1 + Recon 2 = 29 files
+Recon 3 is NOT selected because 29 + 10 = 39 > 30.
+Recon 3 remains pending for next trigger.
+
+Example 2:
+pending files > 30, max_files_per_run=30
+
+Recon 1 = 1 file
+Recon 2 = 1 file
+...
+Recon 30 = 1 file
+
+Expected selected current run:
+30 recons, 30 files total.
+This is allowed because the cap is file-based, not recon-count-based.
+
+Example 3:
+pending files > 30, max_files_per_run=30
+
+Recon 1 = 2 files
+Recon 2 = 2 files
+...
+Recon 15 = 2 files
+
+Expected selected current run:
+15 recons, 30 files total.
+
+Example 4:
+pending files > 30, max_files_per_run=30
+
+Recon 1 = 40 files
+
+Expected selected current run:
+Recon 1 with all 40 files as oversized recon batch.
+Do not split it.
+
+Example 5:
+pending files = 30
+
+Expected:
+Normal mode. Existing behavior unchanged. All 30 are processed the same way current code processes them.
+
+Example 6:
+pending files = 31
+
+Expected:
+Peak mode. Select only one recon-aware batch up to 30 files, unless first eligible recon itself has more than 30 files.
+
+Implementation approach:
+
+First analyze the codebase and identify:
+- where fileConfigWithSideDF or equivalent pending file DataFrame is created
+- where it is collected to rows/sequence
+- where parallel_batch_size is read
+- where ForkJoinPool/ForkJoinTaskSupport is used
+- where `.par` is used
+- where processFile(...) is called
+- exact processFile signature and arguments
+- how config/global.conf/commonProperties are loaded
+
+Search terms:
+- DataPreProcessor
+- CorePreProcessor
+- CPP
+- processFile
+- fileConfigWithSideDF
+- parallel_batch_size
+- ForkJoinPool
+- ForkJoinTaskSupport
+- `.par`
+- commonProperties
+- global.conf
+- ConfigFactory
+- ConfigBuilder
+- run_id
+- recon_id
+
+Config:
+Do not add Oracle config yet.
+Do not modify ConfigBuilder yet.
+Use safe defaults in code through existing commonProperties/global config map.
+
+Add these keys with defaults:
+- cpp.peak.mode.enabled, default true
+- cpp.peak.threshold.files, default 30
+- cpp.max.files.per.run, default 30
+- cpp.preserve.recon.boundary, default true
+- existing parallel_batch_size remains the internal parallelism control
+
+Example:
+val peakModeEnabled =
+  commonProperties.getOrElse("cpp.peak.mode.enabled", "true").toBoolean
+
+val peakThresholdFiles =
+  commonProperties.getOrElse("cpp.peak.threshold.files", "30").toInt
+
+val maxFilesPerRun =
+  commonProperties.getOrElse("cpp.max.files.per.run", "30").toInt
+
+val preserveReconBoundary =
+  commonProperties.getOrElse("cpp.preserve.recon.boundary", "true").toBoolean
+
+val maxParallelFiles =
+  commonProperties.getOrElse("parallel_batch_size", "10").toInt
+
+Peak detection:
+After collecting/listing pending file rows:
+- totalPendingFiles = all pending rows count
+- isPeakMode = peakModeEnabled && totalPendingFiles > peakThresholdFiles
+
+Normal mode:
+If not peak mode:
+- use existing code path unchanged
+- all pending rows are processed exactly as before
+- existing processFile invocation stays unchanged
+
+Peak mode:
+If peak mode:
+- select only one recon-aware limited set for current run
+- selectedRows should be around maxFilesPerRun unless oversized recon rule applies
+- process only selectedRows using the existing parallel/ForkJoin logic
+- remaining rows should not be processed in this application
+
+Important:
+Do not process all batches sequentially in the same application.
+Do not create all batches and loop over them.
+Do not call processFile for remaining rows in the same app.
+
+Implementation detail:
+Create a helper like:
+
+selectReconAwareRowsForCurrentRun(
+  rows: Seq[Row],
+  maxFilesPerRun: Int,
+  reconIdColumnName: String
+): Seq[Row]
+
+Logic:
+1. Convert rows to indexed sequence to preserve original order:
+   rows.zipWithIndex
+2. Group by recon_id while preserving first occurrence order.
+3. For each recon group in order:
+   - reconFileCount = group.size
+   - if selectedRows is empty and reconFileCount > maxFilesPerRun:
+       select full recon group as oversized recon and stop
+   - else if currentSelectedCount + reconFileCount <= maxFilesPerRun:
+       add full recon group
+   - else:
+       stop; leave this recon and later recons for next trigger
+4. Return selected rows only.
+
+Pseudo-code:
+
+def getReconId(row: Row, reconIdColumnName: String): String = {
+  val value = row.getAs[Any](reconIdColumnName)
+  if (value == null) "UNKNOWN" else value.toString
+}
+
+def selectReconAwareRowsForCurrentRun(
+    rows: Seq[Row],
+    maxFilesPerRun: Int,
+    reconIdColumnName: String
+): Seq[Row] = {
+
+  val grouped = rows.zipWithIndex
+    .groupBy { case (row, _) => getReconId(row, reconIdColumnName) }
+    .toSeq
+    .map { case (reconId, indexedRows) =>
+      val sortedRows = indexedRows.sortBy(_._2).map(_._1)
+      val firstIndex = indexedRows.map(_._2).min
+      (reconId, sortedRows, firstIndex)
+    }
+    .sortBy { case (_, _, firstIndex) => firstIndex }
+
+  val selected = scala.collection.mutable.ArrayBuffer[Row]()
+  var selectedCount = 0
+  var stop = false
+
+  grouped.foreach { case (reconId, reconRows, _) =>
+    if (!stop) {
+      val reconFileCount = reconRows.size
+
+      if (selected.isEmpty && reconFileCount > maxFilesPerRun) {
+        // oversized recon, process full recon and stop
+        selected ++= reconRows
+        selectedCount += reconFileCount
+        stop = true
+      } else if (selectedCount + reconFileCount <= maxFilesPerRun) {
+        selected ++= reconRows
+        selectedCount += reconFileCount
+      } else {
+        // adding this recon would exceed max, leave it for next run
+        stop = true
+      }
+    }
+  }
+
+  selected.toSeq
+}
+
+Need to adapt to project’s Scala version:
+- Avoid Scala 2.13-only APIs.
+- Use only Scala 2.11/2.12-compatible code.
+- Do not use toLongOption.
+
+Recon column:
+Use the actual recon id column from the existing DataFrame.
+It may be:
+- recon_id
+- RECON_ID
+- reconid
+- ReconId
+Inspect fileConfigWithSideDF schema/current usage and use the correct column.
+
+After selection:
+val selectedRows =
+  if (isPeakMode && preserveReconBoundary) {
+     selectReconAwareRowsForCurrentRun(fileRowsSeq, maxFilesPerRun, reconIdColumnName)
+  } else {
+     fileRowsSeq
+  }
+
+Then run existing parallel processing on selectedRows only.
+
+Logging:
+Use the project’s logger, not println if logger exists.
+
+Add logs:
+- totalPendingFiles
+- peakModeEnabled
+- peakThresholdFiles
+- maxFilesPerRun
+- preserveReconBoundary
+- isPeakMode
+- selectedRows.size
+- remainingRows count = totalPendingFiles - selectedRows.size
+- selected distinct recon IDs
+- selected recon count
+- whether selected batch is oversized
+- maxParallelFiles
+- normal mode vs peak mode
+
+Example logs:
+[CPP] totalPendingFiles=500, peakModeEnabled=true, peakThresholdFiles=30, isPeakMode=true
+[CPP] Peak mode active. maxFilesPerRun=30, preserveReconBoundary=true
+[CPP] Selected files for current run=29, remainingFiles=471, selectedReconCount=2
+[CPP] Selected recon IDs=1001,1002
+[CPP] Processing selected peak set only. Remaining files will be picked by next trigger.
+
+Oversized log:
+[CPP] Oversized recon selected. reconId=2001, reconFileCount=50, maxFilesPerRun=30
+[CPP] Processing oversized recon in one run to preserve recon boundary.
+
+Required safety:
+- Do not delete existing behavior.
+- Keep normal mode unchanged.
+- Preserve exact processFile invocation.
+- Do not change Spark executor config in this change.
+- Do not change AutoSys or scheduling in this change.
+- Do not add Oracle/global config changes in this change.
+- Do not trigger extra Spark jobs.
+- Do not run multiple batches concurrently.
+- Do not sequentially process all internal batches.
+- Only limit selected files for current run during peak mode.
+
+Acceptance criteria:
+1. pending files = 30:
+   - normal mode
+   - selectedRows = all 30
+   - existing behavior unchanged
+
+2. pending files = 31:
+   - peak mode
+   - selectedRows around 30 files based on recon grouping
+   - remaining rows not processed by current app
+
+3. pending files = 500, maxFilesPerRun=30:
+   - peak mode
+   - selectedRows around 30 files based on recon grouping
+   - remaining rows not processed by current app
+
+4. pending files = 500, maxFilesPerRun=30:
+   Recon 1=25, Recon 2=4, Recon 3=10
+   - selectedRows = Recon 1 + Recon 2 = 29
+   - Recon 3 not processed this run
+
+5. pending files = 500, maxFilesPerRun=30:
+   Recon 1=40
+   - selectedRows = Recon 1 all 40
+   - oversized recon log appears
+   - no split
+
+6. Each selected row is passed to existing processFile exactly as before.
+
+7. Code compiles.
+
+Please deliver:
+1. files/classes/methods changed
+2. exact code diff
+3. explanation of how normal mode remains unchanged
+4. explanation of how peak mode limits file pickup
+5. explanation of how recon continuity is preserved
+6. explanation of why this avoids one CPP app owning 500 files
+7. test scenarios or unit-test style examples for selection logic
+8. compile status
