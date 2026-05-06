@@ -1,43 +1,17 @@
-Hi [Manager Name],
+grep -iE "file size|filesize|size=|bytes|length|content length|len=" application_logs.txt
 
-Sharing the findings from today’s analysis on the long-running CPP/DataPreProcessor application.
+grep -iE "processing file name|file name|input file|source file|record_count|record count|records|bytes|size" application_logs.txt > file_size_check.log
 
-We analyzed the application run and pulled the metadata details for the application ID. The SQL output is attached for reference. Based on the metadata, this application picked up around **325 files** across multiple recons, which explains why the application ran for a long duration.
 
-### Key Findings
+grep -iE "transformation|transform|dmw|filter|filtercriteria|filter criteria|aggregation|aggregate|generatedfeed|xml|mapping|rule|rule applied|expression" application_logs.txt > transformation_check.log
 
-The long runtime does not appear to be caused by a single file running for several hours. From the file-level analysis, the maximum file runtime from processing start to archive was around **16 minutes**, and the average was around **7.3 minutes**.
 
-However, since the application picked up around **325 files**, even with parallel processing enabled, the files are processed in multiple waves. With `parallel_batch_size` set to **10**, this still results in many rounds of file processing inside the same application.
+grep -iE "recon_id|reconid|recon id|recon name|processing file name" application_logs.txt > recon_file_mapping.log
 
-We also validated the thread behavior from the logs. The logs show that parallel processing is getting triggered with **10 threads**, and multiple worker threads are active. So at this point, it does not look like ForkJoin parallelism is completely broken. The workload distribution across threads is not perfectly even, which is expected with ForkJoin/work-stealing behavior.
+grep -iE "parquet|pqt|write|save|output path|target path|InsertIntoHadoopFsRelation|FileOutputCommitter|commit|committed|_temporary|part-" application_logs.txt > parquet_write_check.log
 
-### Proposed Fix
+grep -iE "DAGScheduler|Job|Stage|Submitting|finished|ResultStage|ShuffleMapStage|parquet|write|save" application_logs.txt > spark_job_write_timeline.log
 
-To reduce the risk of one CPP application owning hundreds of files during peak volume, I have applied a Phase 1 fix in the branch.
+grep -iE "shuffle|spill|memory|GC|garbage|executor|task|bytes read|bytes written|input metrics|output metrics" application_logs.txt > spark_resource_metrics_check.log
 
-The change limits CPP peak-mode pickup to around **60 files per application run**. During peak mode, selected files will be moved into a runtime `_peak_mode_processing/<application_id>` directory before processing so that the next CPP trigger does not pick the same files again.
-
-Normal mode behavior remains unchanged.
-
-### Current Status
-
-The code change has been applied and is ready for review/testing. We still need to complete testing to validate:
-
-* Normal mode continues as-is when file count is less than or equal to 60.
-* Peak mode activates when file count is greater than 60.
-* Only 60 files are picked and processed in one CPP application.
-* Remaining files stay in the input path for subsequent triggers.
-* Files moved to `_peak_mode_processing` are not picked again by the next run.
-* Existing archive/success/failure handling continues to work as before.
-
-### Additional Analysis Needed
-
-Although the logs confirm that the 10 parallel threads are being launched and used, more analysis is still required to confirm where the threads spend most of their time. The next step would be to capture or review thread dumps and Spark/YARN evidence to confirm whether the threads are waiting on Spark execution, HDFS/archive operations, Parquet write, Kafka/audit, or resource allocation.
-
-### Summary
-
-Based on today’s analysis, the main issue appears to be the number of files picked by a single CPP application during peak volume. The application picked around 325 files, which caused many waves of processing even with 10-way parallelism. The proposed 60-file cap should reduce the runtime and blast radius of each CPP run. The fix is already applied in the branch and needs review and lower-environment testing.
-
-Thanks,
-[Your Name]
+grep -iE "processing file name|recon_id|reconid|recon name|file size|filesize|bytes|record_count|record count|records|transformation|transform|dmw|filter|filtercriteria|aggregation|generatedfeed|xml|parquet|pqt|write|save|output path|target path|InsertIntoHadoopFsRelation|FileOutputCommitter|commit|archive|moving file|kafka message|audit|shuffle|spill|GC|executor|DAGScheduler|Job|Stage" application_logs.txt > cpp_deep_dive_details.log
