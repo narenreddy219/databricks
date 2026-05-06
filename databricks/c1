@@ -15,3 +15,491 @@ grep -iE "DAGScheduler|Job|Stage|Submitting|finished|ResultStage|ShuffleMapStage
 grep -iE "shuffle|spill|memory|GC|garbage|executor|task|bytes read|bytes written|input metrics|output metrics" application_logs.txt > spark_resource_metrics_check.log
 
 grep -iE "processing file name|recon_id|reconid|recon name|file size|filesize|bytes|record_count|record count|records|transformation|transform|dmw|filter|filtercriteria|aggregation|generatedfeed|xml|parquet|pqt|write|save|output path|target path|InsertIntoHadoopFsRelation|FileOutputCommitter|commit|archive|moving file|kafka message|audit|shuffle|spill|GC|executor|DAGScheduler|Job|Stage" application_logs.txt > cpp_deep_dive_details.log
+
+
+
+#!/bin/bash
+
+# =============================================================================
+# CPP Application Log Evidence Extractor
+# -----------------------------------------------------------------------------
+# Purpose:
+# Extract from CPP application logs:
+# 1. File processing lifecycle
+# 2. File size / byte hints if present
+# 3. Record count if present
+# 4. Recon/file mapping if present
+# 5. Transformation / DMW / filter applicability logs
+# 6. Parquet/PQT/write/save logs
+# 7. Archive/move logs
+# 8. Kafka/audit completion logs
+#
+# Usage:
+#   sh cpp_log_evidence_from_app_logs.sh application_logs.txt
+#
+# Output:
+#   app_log_01_file_lifecycle.psv
+#   app_log_02_file_size_record_count.psv
+#   app_log_03_transformation_filter.psv
+#   app_log_04_parquet_pqt_write.psv
+#   app_log_05_archive_move.psv
+#   app_log_06_kafka_audit.psv
+#   app_log_07_recon_file_mapping.psv
+#   app_log_08_all_evidence.psv
+# =============================================================================
+
+LOG_FILE="$1"
+
+if [ -z "$LOG_FILE" ]; then
+  echo "Usage: sh cpp_log_evidence_from_app_logs.sh <application_log_file>"
+  exit 1
+fi
+
+if [ ! -f "$LOG_FILE" ]; then
+  echo "File not found: $LOG_FILE"
+  exit 1
+fi
+
+echo "Reading log file: $LOG_FILE"
+
+# -----------------------------------------------------------------------------
+# 01. File lifecycle
+# -----------------------------------------------------------------------------
+grep -iE "processing file name|filter processing completed|processFile|completed|success|failed|exception|error|moving file|archive|kafka message" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","event_type","file_name","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  file="";
+  event="OTHER";
+
+  if (match(raw, /processing file name: [^ ]+/)) {
+    file=substr(raw, RSTART+22, RLENGTH-22);
+    event="PROCESSING_START";
+  }
+  else if (lower ~ /filter processing completed/) {
+    event="FILTER_PROCESSING_COMPLETED";
+    if (match(raw, /\[[^]]+\]/)) {
+      file=substr(raw, RSTART+1, RLENGTH-2);
+    }
+  }
+  else if (lower ~ /moving file/ || lower ~ /archive/) {
+    event="ARCHIVE_OR_MOVE";
+  }
+  else if (lower ~ /kafka message/ && lower ~ /success/) {
+    event="KAFKA_AUDIT_SUCCESS";
+    if (match(raw, /"file_name":"[^"]+"/)) {
+      file=substr(raw, RSTART+13, RLENGTH-14);
+    }
+  }
+  else if (lower ~ /kafka message/) {
+    event="KAFKA_AUDIT";
+    if (match(raw, /"file_name":"[^"]+"/)) {
+      file=substr(raw, RSTART+13, RLENGTH-14);
+    }
+  }
+  else if (lower ~ /processfile/) {
+    event="PROCESSFILE";
+  }
+  else if (lower ~ /success/) {
+    event="SUCCESS";
+  }
+  else if (lower ~ /failed|exception|error/) {
+    event="FAILED_OR_ERROR";
+  }
+  else if (lower ~ /completed/) {
+    event="COMPLETED";
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,event,file,raw;
+}
+' > app_log_01_file_lifecycle.psv
+
+echo "Created app_log_01_file_lifecycle.psv"
+
+
+# -----------------------------------------------------------------------------
+# 02. File size / record count evidence from logs
+# -----------------------------------------------------------------------------
+grep -iE "file size|filesize|size=|bytes|byte|length|content length|len=|record_count|record count|records|number of records|input size|output size|rows" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","metric_type","file_name_hint","metric_hint","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  file="";
+  metric="";
+  metric_type="OTHER_SIZE_RECORD";
+
+  if (lower ~ /file size|filesize|size=|bytes|byte|length|content length|len=/) {
+    metric_type="FILE_SIZE_OR_BYTES";
+  }
+  else if (lower ~ /record_count|record count|records|number of records|rows/) {
+    metric_type="RECORD_COUNT_OR_ROWS";
+  }
+  else if (lower ~ /input size/) {
+    metric_type="INPUT_SIZE";
+  }
+  else if (lower ~ /output size/) {
+    metric_type="OUTPUT_SIZE";
+  }
+
+  if (match(raw, /[A-Za-z0-9._-]+\.(dat\.gz|dat|csv|txt|json|parquet|pqt)/)) {
+    file=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (match(raw, /[0-9]+[ ]*(bytes|byte|records|rows|MB|GB|KB|mb|gb|kb)/)) {
+    metric=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,metric_type,file,metric,raw;
+}
+' > app_log_02_file_size_record_count.psv
+
+echo "Created app_log_02_file_size_record_count.psv"
+
+
+# -----------------------------------------------------------------------------
+# 03. Transformation / filter / DMW applicability from logs
+# -----------------------------------------------------------------------------
+grep -iE "transformation|transform|dmw|filter|filtercriteria|filter criteria|aggregation|aggregate|generatedfeed|generated feed|xml|mapping|rule|expression|Initializing DataFrame|filter processing completed" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","event_type","recon_hint","file_hint","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  recon="";
+  file="";
+  event="OTHER_TRANSFORMATION";
+
+  if (lower ~ /initializing dataframe/) {
+    event="DATAFRAME_INIT";
+  }
+  else if (lower ~ /filter processing completed/) {
+    event="FILTER_COMPLETED";
+  }
+  else if (lower ~ /dmw/) {
+    event="DMW";
+  }
+  else if (lower ~ /transformation|transform/) {
+    event="TRANSFORMATION";
+  }
+  else if (lower ~ /filtercriteria|filter criteria|filter/) {
+    event="FILTER";
+  }
+  else if (lower ~ /aggregation|aggregate/) {
+    event="AGGREGATION";
+  }
+  else if (lower ~ /generatedfeed|generated feed|xml/) {
+    event="GENERATED_FEED_XML";
+  }
+  else if (lower ~ /mapping|rule|expression/) {
+    event="RULE_MAPPING_EXPRESSION";
+  }
+
+  if (match(raw, /recon[_ ]?id[=: ]+[0-9]+/)) {
+    recon=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (match(raw, /[A-Za-z0-9._-]+\.(dat\.gz|dat|csv|txt|json|parquet|pqt)/)) {
+    file=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,event,recon,file,raw;
+}
+' > app_log_03_transformation_filter.psv
+
+echo "Created app_log_03_transformation_filter.psv"
+
+
+# -----------------------------------------------------------------------------
+# 04. Parquet / PQT / write evidence from logs
+# -----------------------------------------------------------------------------
+grep -iE "parquet|pqt|write|save|output path|target path|InsertIntoHadoopFsRelation|FileOutputCommitter|commit|committed|_temporary|part-" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","event_type","path_hint","file_hint","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  path="";
+  file="";
+  event="OTHER_WRITE";
+
+  if (lower ~ /parquet/) {
+    event="PARQUET";
+  }
+  else if (lower ~ /pqt/) {
+    event="PQT";
+  }
+  else if (lower ~ /write|save/) {
+    event="WRITE_SAVE";
+  }
+  else if (lower ~ /commit|committed|fileoutputcommitter/) {
+    event="COMMIT";
+  }
+
+  if (match(raw, /hdfs:\/\/[^ ]+/)) {
+    path=substr(raw, RSTART, RLENGTH);
+  }
+  else if (match(raw, /\/[^ ]+/)) {
+    path=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (match(raw, /[A-Za-z0-9._-]+\.(dat\.gz|dat|csv|txt|json|parquet|pqt)/)) {
+    file=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,event,path,file,raw;
+}
+' > app_log_04_parquet_pqt_write.psv
+
+echo "Created app_log_04_parquet_pqt_write.psv"
+
+
+# -----------------------------------------------------------------------------
+# 05. Archive / move / rename evidence
+# -----------------------------------------------------------------------------
+grep -iE "moving file|move|rename|archive|delete|copy|source to archive|done|_peak_mode_processing" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","event_type","path_hint","file_hint","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  path="";
+  file="";
+  event="OTHER_HDFS";
+
+  if (lower ~ /rename/) {
+    event="RENAME";
+  }
+  else if (lower ~ /moving file|move/) {
+    event="MOVE";
+  }
+  else if (lower ~ /archive/) {
+    event="ARCHIVE";
+  }
+  else if (lower ~ /copy/) {
+    event="COPY";
+  }
+  else if (lower ~ /delete/) {
+    event="DELETE";
+  }
+  else if (lower ~ /_peak_mode_processing/) {
+    event="PEAK_MODE_PROCESSING";
+  }
+
+  if (match(raw, /hdfs:\/\/[^ ]+/)) {
+    path=substr(raw, RSTART, RLENGTH);
+  }
+  else if (match(raw, /\/[^ ]+/)) {
+    path=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (match(raw, /[A-Za-z0-9._-]+\.(dat\.gz|dat|csv|txt|json|parquet|pqt)/)) {
+    file=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,event,path,file,raw;
+}
+' > app_log_05_archive_move.psv
+
+echo "Created app_log_05_archive_move.psv"
+
+
+# -----------------------------------------------------------------------------
+# 06. Kafka / audit evidence
+# -----------------------------------------------------------------------------
+grep -iE "kafka message|audit|INSERT|status|SUCCESS|FAILED|record_count|record count|file_name|recon_id|reconid" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","event_type","recon_id","file_name","status","record_count","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  recon="";
+  file="";
+  status="";
+  record="";
+  event="OTHER_AUDIT";
+
+  if (lower ~ /kafka message/) {
+    event="KAFKA_MESSAGE";
+  }
+  else if (lower ~ /audit/) {
+    event="AUDIT";
+  }
+  else if (lower ~ /insert/) {
+    event="AUDIT_INSERT";
+  }
+
+  if (match(raw, /"file_name":"[^"]+"/)) {
+    file=substr(raw, RSTART+13, RLENGTH-14);
+  }
+
+  if (match(raw, /"recon_id":"[^"]+"/)) {
+    recon=substr(raw, RSTART+12, RLENGTH-13);
+  }
+  else if (match(raw, /recon_id[=: ]+[0-9]+/)) {
+    recon=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (lower ~ /success/) {
+    status="SUCCESS";
+  }
+  else if (lower ~ /failed|failure|error/) {
+    status="FAILED_OR_ERROR";
+  }
+
+  if (match(raw, /"record_count":"[^"]+"/)) {
+    record=substr(raw, RSTART+16, RLENGTH-17);
+  }
+  else if (match(raw, /record_count[=: ]+[0-9]+/)) {
+    record=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,event,recon,file,status,record,raw;
+}
+' > app_log_06_kafka_audit.psv
+
+echo "Created app_log_06_kafka_audit.psv"
+
+
+# -----------------------------------------------------------------------------
+# 07. Recon to file mapping if present in logs
+# -----------------------------------------------------------------------------
+grep -iE "recon_id|reconid|recon id|recon name|file_name|file name|processing file name|kafka message|audit" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","recon_hint","file_hint","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  recon="";
+  file="";
+
+  if (match(raw, /"recon_id":"[^"]+"/)) {
+    recon=substr(raw, RSTART+12, RLENGTH-13);
+  }
+  else if (match(raw, /recon_id[=: ]+[0-9]+/)) {
+    recon=substr(raw, RSTART, RLENGTH);
+  }
+  else if (match(tolower(raw), /reconid[=: ]+[0-9]+/)) {
+    recon=substr(raw, RSTART, RLENGTH);
+  }
+
+  if (match(raw, /"file_name":"[^"]+"/)) {
+    file=substr(raw, RSTART+13, RLENGTH-14);
+  }
+  else if (match(raw, /processing file name: [^ ]+/)) {
+    file=substr(raw, RSTART+22, RLENGTH-22);
+  }
+  else if (match(raw, /[A-Za-z0-9._-]+\.(dat\.gz|dat|csv|txt|json|parquet|pqt)/)) {
+    file=substr(raw, RSTART, RLENGTH);
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,recon,file,raw;
+}
+' > app_log_07_recon_file_mapping.psv
+
+echo "Created app_log_07_recon_file_mapping.psv"
+
+
+# -----------------------------------------------------------------------------
+# 08. All evidence combined
+# -----------------------------------------------------------------------------
+grep -iE "processing file name|processFile|recon_id|reconid|recon name|file size|filesize|bytes|record_count|record count|records|rows|transformation|transform|dmw|filter|filtercriteria|aggregation|generatedfeed|xml|parquet|pqt|write|save|output path|target path|InsertIntoHadoopFsRelation|FileOutputCommitter|commit|archive|moving file|kafka message|audit|shuffle|spill|GC|executor|DAGScheduler|Job|Stage|Exception|ERROR|FAILED|SUCCESS" "$LOG_FILE" \
+| awk '
+BEGIN {
+  OFS="|";
+  print "timestamp","thread","category","raw_log";
+}
+{
+  ts=$1;
+  thread=$2;
+  raw=$0;
+  lower=tolower(raw);
+  cat="OTHER";
+
+  if (lower ~ /processing file name|processfile/) {
+    cat="FILE_PROCESSING";
+  }
+  else if (lower ~ /file size|filesize|bytes|record_count|record count|records|rows/) {
+    cat="SIZE_RECORD";
+  }
+  else if (lower ~ /transformation|transform|dmw|filter|filtercriteria|aggregation|generatedfeed|xml/) {
+    cat="TRANSFORMATION_FILTER";
+  }
+  else if (lower ~ /parquet|pqt|write|save|commit/) {
+    cat="PARQUET_PQT_WRITE";
+  }
+  else if (lower ~ /archive|moving file|move|rename|delete|copy/) {
+    cat="ARCHIVE_MOVE";
+  }
+  else if (lower ~ /kafka|audit|insert/) {
+    cat="KAFKA_AUDIT";
+  }
+  else if (lower ~ /dagscheduler|job|stage|executor|task|shuffle|spill|gc/) {
+    cat="SPARK_EVENT";
+  }
+  else if (lower ~ /exception|error|failed/) {
+    cat="ERROR_FAILURE";
+  }
+
+  gsub(/\|/, " ", raw);
+  print ts,thread,cat,raw;
+}
+' > app_log_08_all_evidence.psv
+
+echo "Created app_log_08_all_evidence.psv"
+
+
+echo ""
+echo "Done. Generated:"
+echo "app_log_01_file_lifecycle.psv"
+echo "app_log_02_file_size_record_count.psv"
+echo "app_log_03_transformation_filter.psv"
+echo "app_log_04_parquet_pqt_write.psv"
+echo "app_log_05_archive_move.psv"
+echo "app_log_06_kafka_audit.psv"
+echo "app_log_07_recon_file_mapping.psv"
+echo "app_log_08_all_evidence.psv"
