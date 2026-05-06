@@ -503,3 +503,215 @@ echo "app_log_05_archive_move.psv"
 echo "app_log_06_kafka_audit.psv"
 echo "app_log_07_recon_file_mapping.psv"
 echo "app_log_08_all_evidence.psv"
+
+
+
+
+/* =====================================================================
+   CPP Application ID - Recon/File Workload, Estimated File Size,
+   Transformation Applicability, and PQT/Parquet Evidence
+   ---------------------------------------------------------------------
+   Purpose:
+   For one CPP/DataPreProcessor application_id:
+   1. List all recons run in that application.
+   2. List files processed under each recon.
+   3. Use record_count as workload proxy.
+   4. Estimate uncompressed file size using assumed average bytes/record.
+   5. Identify whether file is GZ compressed.
+   6. Identify whether transformation/filter/aggregation metadata applies.
+   7. Check whether audit message contains Parquet/PQT/write evidence.
+
+   IMPORTANT:
+   - This does NOT give actual physical file size.
+   - It estimates size using record_count * assumed bytes per record.
+   - Change avg_bytes_per_record as needed after confirming sample files.
+   - For exact file size, HDFS/archive/source file is required.
+   - For actual Parquet/PQT output size, Spark History or output path is required.
+
+   Replace:
+   <<APPLICATION_ID>>
+===================================================================== */
+
+WITH params AS (
+    SELECT
+        500 AS avg_bytes_per_record
+    FROM dual
+),
+
+app_files AS (
+    SELECT
+        run_id AS application_id,
+        TO_CHAR(recon_id) AS recon_id,
+        recon_name,
+        cob_date,
+        file_name,
+        file_type,
+        status,
+        NVL(record_count, 0) AS record_count,
+        created_time,
+        message,
+
+        CASE
+            WHEN LOWER(file_name) LIKE '%.gz' THEN 'Y'
+            ELSE 'N'
+        END AS is_gz_file
+
+    FROM fasttrac.om_recon_audit_log
+    WHERE run_id = '<<APPLICATION_ID>>'
+      AND comp_nm IN ('DataPreProcessor', 'CorePreProcessor')
+),
+
+recon_metadata AS (
+    SELECT
+        TO_CHAR(r.id) AS recon_id,
+
+        r.leftfeed_id,
+        lf_left.userfeedid AS left_userfeedid,
+
+        CASE WHEN lf_left.filtercriteriaxml IS NOT NULL THEN 'Y' ELSE 'N' END AS left_filter_applicable,
+        CASE WHEN lf_left.aggregationinfo IS NOT NULL THEN 'Y' ELSE 'N' END AS left_aggregation_applicable,
+        CASE WHEN lf_left.aggregatefiltercriteriaxml IS NOT NULL THEN 'Y' ELSE 'N' END AS left_aggregate_filter_applicable,
+        CASE WHEN gf_left.xmldata IS NOT NULL THEN 'Y' ELSE 'N' END AS left_transformation_xml_applicable,
+
+        r.rightfeed_id,
+        lf_right.userfeedid AS right_userfeedid,
+
+        CASE WHEN lf_right.filtercriteriaxml IS NOT NULL THEN 'Y' ELSE 'N' END AS right_filter_applicable,
+        CASE WHEN lf_right.aggregationinfo IS NOT NULL THEN 'Y' ELSE 'N' END AS right_aggregation_applicable,
+        CASE WHEN lf_right.aggregatefiltercriteriaxml IS NOT NULL THEN 'Y' ELSE 'N' END AS right_aggregate_filter_applicable,
+        CASE WHEN gf_right.xmldata IS NOT NULL THEN 'Y' ELSE 'N' END AS right_transformation_xml_applicable,
+
+        CASE
+            WHEN lf_left.filtercriteriaxml IS NOT NULL
+              OR lf_left.aggregationinfo IS NOT NULL
+              OR lf_left.aggregatefiltercriteriaxml IS NOT NULL
+              OR gf_left.xmldata IS NOT NULL
+              OR lf_right.filtercriteriaxml IS NOT NULL
+              OR lf_right.aggregationinfo IS NOT NULL
+              OR lf_right.aggregatefiltercriteriaxml IS NOT NULL
+              OR gf_right.xmldata IS NOT NULL
+            THEN 'Y'
+            ELSE 'N'
+        END AS transformation_or_filter_applicable
+
+    FROM fasttrac.reconciliation r
+
+    LEFT JOIN fasttrac.filterfeed lf_left
+        ON lf_left.id = r.leftfeed_id
+
+    LEFT JOIN fasttrac.filterfeed lf_right
+        ON lf_right.id = r.rightfeed_id
+
+    LEFT JOIN fasttrac.generatedfeed gf_left
+        ON gf_left.feed_id = r.leftfeed_id
+
+    LEFT JOIN fasttrac.generatedfeed gf_right
+        ON gf_right.feed_id = r.rightfeed_id
+),
+
+expected_feed_metadata AS (
+    SELECT
+        TO_CHAR(reconid) AS recon_id,
+        COUNT(*) AS expected_file_pattern_count,
+        COUNT(DISTINCT feed_id) AS expected_feed_count,
+        COUNT(DISTINCT filetype) AS expected_file_type_count
+    FROM reconmgmt.v_om_one_recon_merger_config
+    GROUP BY TO_CHAR(reconid)
+)
+
+SELECT
+    af.application_id,
+    af.recon_id,
+    af.recon_name,
+    af.cob_date,
+
+    af.file_name,
+    af.file_type,
+    af.status,
+    af.record_count,
+
+    af.is_gz_file,
+
+    p.avg_bytes_per_record AS assumed_avg_bytes_per_record,
+
+    ROUND((af.record_count * p.avg_bytes_per_record) / 1024 / 1024, 2) AS estimated_uncompressed_size_mb,
+
+    ROUND((af.record_count * p.avg_bytes_per_record) / 1024 / 1024 / 1024, 2) AS estimated_uncompressed_size_gb,
+
+    CASE
+        WHEN af.is_gz_file = 'Y'
+        THEN 'GZ compressed input. Spark must decompress and process records. Size shown is estimated uncompressed workload size.'
+        ELSE 'Non-GZ or extension not identified. Size shown is estimated using record count.'
+    END AS file_size_estimation_note,
+
+    NVL(efm.expected_feed_count, 0) AS expected_feed_count,
+    NVL(efm.expected_file_pattern_count, 0) AS expected_file_pattern_count,
+    NVL(efm.expected_file_type_count, 0) AS expected_file_type_count,
+
+    rm.leftfeed_id,
+    rm.left_userfeedid,
+    rm.left_filter_applicable,
+    rm.left_aggregation_applicable,
+    rm.left_aggregate_filter_applicable,
+    rm.left_transformation_xml_applicable,
+
+    rm.rightfeed_id,
+    rm.right_userfeedid,
+    rm.right_filter_applicable,
+    rm.right_aggregation_applicable,
+    rm.right_aggregate_filter_applicable,
+    rm.right_transformation_xml_applicable,
+
+    rm.transformation_or_filter_applicable,
+
+    CASE
+        WHEN LOWER(af.message) LIKE '%parquet%'
+          OR LOWER(af.message) LIKE '%pqt%'
+          OR LOWER(af.message) LIKE '%write%'
+          OR LOWER(af.message) LIKE '%save%'
+        THEN 'Y'
+        ELSE 'N'
+    END AS parquet_or_pqt_evidence_in_audit_message,
+
+    CASE
+        WHEN LOWER(af.message) LIKE '%parquet%' THEN 'PARQUET_IN_MESSAGE'
+        WHEN LOWER(af.message) LIKE '%pqt%' THEN 'PQT_IN_MESSAGE'
+        WHEN LOWER(af.message) LIKE '%write%' THEN 'WRITE_IN_MESSAGE'
+        WHEN LOWER(af.message) LIKE '%save%' THEN 'SAVE_IN_MESSAGE'
+        ELSE 'NOT_AVAILABLE_IN_AUDIT_MESSAGE'
+    END AS parquet_pqt_message_evidence_type,
+
+    af.created_time,
+
+    CASE
+        WHEN af.record_count >= 1000000
+         AND rm.transformation_or_filter_applicable = 'Y'
+        THEN 'HIGH_VOLUME_WITH_TRANSFORMATION'
+
+        WHEN af.record_count >= 1000000
+        THEN 'HIGH_VOLUME'
+
+        WHEN af.record_count >= 100000
+         AND rm.transformation_or_filter_applicable = 'Y'
+        THEN 'MEDIUM_VOLUME_WITH_TRANSFORMATION'
+
+        WHEN rm.transformation_or_filter_applicable = 'Y'
+        THEN 'TRANSFORMATION_APPLICABLE'
+
+        ELSE 'NORMAL'
+    END AS workload_category
+
+FROM app_files af
+
+CROSS JOIN params p
+
+LEFT JOIN recon_metadata rm
+    ON rm.recon_id = af.recon_id
+
+LEFT JOIN expected_feed_metadata efm
+    ON efm.recon_id = af.recon_id
+
+ORDER BY
+    af.recon_id,
+    af.record_count DESC,
+    af.file_name;
