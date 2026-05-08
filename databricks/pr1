@@ -1,0 +1,114 @@
+Here is a rewritten, highly optimized version of your prompt. I have restructured it to be the perfect **Master Prompt** to feed into an AI coding assistant (like Cursor or GitHub Copilot) or to hand directly to a data engineering team.
+
+It groups related concepts, strictly enforces your "Do Not Change" constraints, and flows logically from the infrastructure layer (AutoSys/YARN) down to the Scala code implementation.
+
+---
+
+### 📋 Copy and Paste This Master Prompt:
+
+**System Role & Context:**
+You are an Expert Big Data Engineer. We need to design and implement a "Peak-Surge Handling" feature for an existing enterprise Spark application called **Core PreProcessor (CPP)**.
+
+* **Base App Name:** `167969_OM_GRU_RECON_Core_Preprocessor`
+* **The Problem:** At 2 AM, 300-360+ files land in HDFS. Currently, AutoSys triggers CPP every 15 minutes, but only one CPP app can run at a time. It picks up *all* 300+ files and runs for 5-6 hours, blocking all subsequent 15-minute triggers.
+* **The Goal:** Implement split-batch, controlled concurrent CPP launches using runtime file claiming and fixed YARN application slots, without altering the existing core processing logic.
+
+---
+
+### 🛑 CRITICAL ARCHITECTURAL CONSTRAINTS
+
+Before writing any code, you must acknowledge and strictly adhere to these rules:
+
+1. **NO CORE CHANGES:** Do exactly zero refactoring of the existing `CorePreProcessor.scala` logic. Do not change existing variable names, function signatures, transformation/filter logic, Parquet write logic, archive logic, Kafka/audit logic, or global source/archive path variables.
+2. **DELEGATION ONLY:** The main entry point will only be modified to count files and decide between "Normal Mode" and "Peak Mode". If Peak Mode is triggered, it delegates the heavy lifting to a new, isolated helper class (`PeakModeFileClaimHelper`).
+3. **NO CONFIG POLLUTION:** Configs are loaded from the Config Builder database (`fasttrac.om_one_recon_meta_data_comp`) at startup. Do not query the DB per file or every 15 minutes.
+
+---
+
+### 🛠️ PART 1: The AutoSys / Shell Launch Guard
+
+We are replacing the strict "exit if running > 0" script with a controlled concurrency model.
+
+**New Logic Requirements:**
+
+* **Max Concurrency:** Defined by `cpp.max.concurrent.apps` (Default: 1, Target: 2).
+* **App Naming:** **DO NOT append timestamps.** Use fixed, reusable YARN slot names to make tracking easy:
+* Slot 1: `167969_OM_GRU_RECON_Core_Preprocessor_PEAK_LAUNCH_01`
+* Slot 2: `167969_OM_GRU_RECON_Core_Preprocessor_PEAK_LAUNCH_02`
+* Slot 3: `167969_OM_GRU_RECON_Core_Preprocessor_PEAK_LAUNCH_03`
+
+
+* **Behavior:**
+1. Check YARN for apps running with the prefix `167969_OM_GRU_RECON_Core_Preprocessor_PEAK_LAUNCH`.
+2. If `running_count >= MAX_CONCURRENT_APPS`, log `[CPP LaunchGuard] Max peak concurrency reached` and `exit 0`.
+3. If a slot is available, pick the first non-running slot and launch the Spark job with that exact name.
+
+
+
+---
+
+### 🛠️ PART 2: The Scala Main Entry Point
+
+Modify the main execution flow to dynamically route traffic based on the HDFS file count.
+
+**Configuration Keys (Loaded at startup):**
+
+* `cpp.file.pickup.limit.enabled` (Boolean, default: `false`)
+* `cpp.max.files.per.run` (Int, default: `50`)
+* `cpp.peak.processing.base.path` (String, MUST NOT be empty if peak mode is enabled)
+* `cpp.peak.processing.dir.name` (String, default: `cpp_peak_mode_processing`)
+
+**The Decision Tree:**
+
+1. List eligible files from `source_file_hdfs_path`. (If 0, exit normally).
+2. **Normal Mode:** If `eligibleFileCount <= cpp.max.files.per.run`.
+* Process all listed files using the exact existing CPP flow. No file moving, no runtime directories.
+
+
+3. **Peak Mode:** If `eligibleFileCount > cpp.max.files.per.run` AND limit is enabled.
+* Failsafe: If `peak.processing.base.path` is missing, fail fast with a clear error.
+* Call `PeakModeFileClaimHelper.claimFiles(...)`.
+* If no files are successfully claimed, log and exit safely.
+* Pass the successfully claimed files and the new runtime path back to the *existing* CPP processing flow.
+
+
+
+---
+
+### 🛠️ PART 3: The `PeakModeFileClaimHelper` Class
+
+Create this entirely new class to handle the file claiming physics safely.
+
+**Core Responsibilities:**
+
+1. **Select:** Grab only the first N files (where N = `maxFilesPerRun`). Leave the rest in the input folder.
+2. **Isolate:** Create a runtime directory. **CRITICAL:** This directory MUST be outside the source input directory so standard file listing doesn't accidentally pick it up. It must be on the same HDFS nameservice for atomic renames.
+* *Path format:* `<cpp.peak.processing.base.path>/cpp_peak_mode_processing/<application_id>/`
+
+
+3. **Claim (Move):** Use HDFS `rename` (move, not copy) to transfer the selected N files from the input directory to the runtime directory. Only successfully moved files go into the `claimedFiles` list.
+4. **Cleanup:** After the main processing/archiving finishes, delete the `<application_id>` runtime directory **ONLY IF** it is completely empty.
+
+**Suggested Case Classes:**
+
+```scala
+case class PeakModeConfig(enabled: Boolean, maxFilesPerRun: Int, peakProcessingBasePath: String, peakProcessingDirName: String)
+
+case class PeakModeClaimResult(isPeakMode: Boolean, runtimeProcessingPath: String, claimedFiles: Seq[String], failedFiles: Seq[String], remainingFileCount: Int)
+
+```
+
+---
+
+### 🧪 PART 4: Acceptance Criteria & Test Boundaries
+
+Ensure the code passes these specific boundary scenarios:
+
+* **0 files:** No processing.
+* **50 files (Threshold=50):** NORMAL mode. Processes all 50 in place.
+* **51 files (Threshold=50):** PEAK mode. 50 files moved to runtime dir and processed. 1 file stays in input.
+* **300 files (Threshold=50):** PEAK mode. 50 files moved and processed. 250 stay in input.
+* **Failed HDFS Rename:** Skips that specific file, logs warning, processes the rest of the successfully claimed files.
+* **Logging:** Must use prefix `[CPP PeakMode]` for Scala logs and `[CPP LaunchGuard]` for shell script logs.
+
+Please generate the Shell script updates and the Scala `PeakModeFileClaimHelper` and Main class integration based on these exact specifications.
