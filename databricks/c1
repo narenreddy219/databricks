@@ -715,3 +715,47 @@ ORDER BY
     af.recon_id,
     af.record_count DESC,
     af.file_name;
+
+
+
+
+We need to update ReconConfigBuilder to include the new DataPreProcessor peak-mode configuration parameters from the metadata table fasttrac.om_one_recon_meta_data_comp.
+
+Context:
+The CPP/DataPreProcessor peak surge logic has been implemented in ReconDataPreProcessor. The runtime config should come from Config Builder metadata, not hardcoded values.
+
+New parameters:
+1. cpp.file.pickup.limit.enabled = true
+2. cpp.max.files.per.run = 60
+3. cpp.peak.processing.dir.name = _peak_mode_processing
+
+Metadata table:
+fasttrac.om_one_recon_meta_data_comp
+
+Relevant columns:
+RECONID
+ENV
+COMP_ID
+PARAM_NAME
+PARAM_VALUE
+
+Component:
+COMP_ID = DataPreProcessor
+
+Task:
+1. Check how ReconConfigBuilder currently reads DataPreProcessor parameters from om_one_recon_meta_data_comp.
+2. Confirm whether any code change is required or if adding metadata rows is sufficient.
+3. If Config Builder dynamically pulls all PARAM_NAME/PARAM_VALUE pairs for COMP_ID = DataPreProcessor, do not change Scala logic.
+4. Add a SQL script under the scripts/resources area to MERGE the three new parameters into om_one_recon_meta_data_comp for UAT.
+5. Use MERGE instead of INSERT so the script is idempotent.
+6. Validate generated config includes these entries:
+   cpp.file.pickup.limit.enabled=true
+   cpp.max.files.per.run=60
+   cpp.peak.processing.dir.name=_peak_mode_processing
+7. Add logging or validation if Config Builder skips unknown parameters.
+
+Acceptance Criteria:
+- Running the DB script adds/updates the three DataPreProcessor metadata rows.
+- Config Builder output includes the three new parameters.
+- ReconDataPreProcessor can read these values from generated config.
+- Existing DataPreProcessor parameters remain unchanged.
