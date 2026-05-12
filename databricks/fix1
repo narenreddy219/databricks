@@ -1,0 +1,25 @@
+private def fixParseFunctionInputs(expression: String): String = {
+  var expr = expression
+
+  expr = expr.replaceAll(
+    """Double\.parseDouble\(([-+]?\d+(\.\d+)?([eE][-+]?\d+)?)\)""",
+    """Double.parseDouble("$1")"""
+  )
+
+  expr = expr.replaceAll(
+    """Float\.parseFloat\(([-+]?\d+(\.\d+)?([eE][-+]?\d+)?)\)""",
+    """Float.parseFloat("$1")"""
+  )
+
+  expr = expr.replaceAll(
+    """Integer\.parseInt\(([-+]?\d+)\)""",
+    """Integer.parseInt("$1")"""
+  )
+
+  expr = expr.replaceAll(
+    """Long\.parseLong\(([-+]?\d+)\)""",
+    """Long.parseLong("$1")"""
+  )
+
+  expr
+}
