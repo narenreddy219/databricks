@@ -1,0 +1,42 @@
+@Test
+def testBeanShellResultAfterInterpretation(): Unit = {
+  val schema = StructType(Seq(
+    StructField("Double_Amount", DoubleType, nullable = true),
+    StructField("Arrangement_Desc", StringType, nullable = true)
+  ))
+
+  val inputText =
+    "Assigned to CITIBank for issuance of BANK GUrantied in FAVOUR of \"The Preside of INDIA , Through --- \\C"
+
+  val row = new GenericRowWithSchema(
+    Array(
+      123.45,
+      inputText
+    ),
+    schema
+  )
+
+  val numericExpr = "Double.parseDouble([Double_Amount])"
+
+  val numericResult =
+    AdvanceUdfUtil.getEvalExpression(row, numericExpr, "dummyFeedFile", false)
+
+  println(s"Input Expression        : $numericExpr")
+  println(s"BeanShell Final Result  : $numericResult")
+
+  assertEquals("123.45", numericResult)
+
+  val stringExpr =
+    "[Arrangement_Desc].replace(\"\\\\\", \"\").replace(\"\\\"\", \"\")"
+
+  val stringResult =
+    AdvanceUdfUtil.getEvalExpression(row, stringExpr, "dummyFeedFile", false)
+
+  println(s"Input Expression        : $stringExpr")
+  println(s"BeanShell Final Result  : $stringResult")
+
+  assertEquals(
+    "Assigned to CITIBank for issuance of BANK GUrantied in FAVOUR of The Preside of INDIA , Through --- C",
+    stringResult
+  )
+}
