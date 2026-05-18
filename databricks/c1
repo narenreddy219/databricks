@@ -759,3 +759,36 @@ Acceptance Criteria:
 - Config Builder output includes the three new parameters.
 - ReconDataPreProcessor can read these values from generated config.
 - Existing DataPreProcessor parameters remain unchanged.
+
+
+
+Objective:
+Build a production-ready real-time ingestion framework to consume events from AWS MSK and persist them into Apache Iceberg tables using existing audit logger design patterns.
+
+Business/Technical Context:
+The current requirement is to enable streaming ingestion from MSK into Iceberg as part of the 166330 integration work. The solution should support secure connectivity, reliable streaming, schema governance, fault tolerance, monitoring, and reconciliation readiness.
+
+Scope:
+This epic covers the end-to-end delivery of the MSK to Iceberg ingestion capability, including MSK connectivity validation, IAM/TLS security checks, Iceberg schema design, S3/catalog access validation, streaming consumer implementation, checkpointing, retry/error handling, DLQ/error path, performance tuning, reconciliation validation, and operational runbook preparation.
+
+Key Deliverables:
+1. Validated MSK connectivity, IAM/TLS setup, consumer authentication, Iceberg catalog access, and S3 permissions.
+2. Finalized Iceberg schema strategy, payload mapping, metadata columns, and partitioning approach.
+3. Implemented real-time streaming consumer from MSK topic to Iceberg table.
+4. Implemented checkpointing, restart safety, retry handling, idempotency checks, and DLQ/error handling.
+5. Tuned micro-batch interval, file sizing, partition strategy, Iceberg write options, and commit behavior.
+6. Completed E2E testing, record-count reconciliation, data correctness validation, failure scenario testing, monitoring checklist, and runbook.
+
+Success Criteria:
+- MSK events are consumed successfully and written into Iceberg.
+- Iceberg records match the expected MSK input count.
+- The job can restart safely from the last committed checkpoint.
+- Bad records are handled through the agreed error/DLQ path.
+- Schema and partitioning decisions are documented.
+- Performance and write behavior are validated for expected volume.
+- Runbook and UAT handoff checklist are completed.
+
+Target Timeline:
+Start Date: May 19, 2026
+Development Complete: May 29, 2026
+UAT Ready: June 3, 2026
