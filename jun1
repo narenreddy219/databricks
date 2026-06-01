@@ -1,0 +1,129 @@
+Create a production-ready Bash script named download_latest_business_files_to_uat.sh.
+
+Purpose:
+I need to run this script from my laptop or IntelliJ Terminal. The script should connect to IBM Cloud Object Storage using AWS CLI, search S3 day-wise backup partitions, identify files with the latest business date in the filename, download those files to my laptop staging directory, and then copy them to a UAT edge node under /tmp/nr51159 using SCP.
+
+Use this overall flow:
+1. IBM S3 bucket
+2. Laptop local staging directory
+3. UAT edge node /tmp/nr51159/business_date=YYYY-MM-DD
+
+Requirements:
+
+1. Configuration section at the top:
+   - BUCKET="your-bucket-name"
+   - ENDPOINT="https://s3.us-south.cloud-object-storage.appdomain.cloud"
+   - BASE_PREFIX="data/gfolygruy/raw/recon/pp_sourcedata_archive"
+   - LOCAL_BASE_DIR="/tmp/nr51159_s3_stage"
+   - UAT_USER="your_uat_user"
+   - UAT_HOST="your_uat_edge_node_hostname"
+   - UAT_TARGET_DIR="/tmp/nr51159"
+   - START_DATE=$(date +%Y-%m-%d)
+   - LOOKBACK_DAYS=90
+   - FILE_NAME_CONTAINS="pp_sourcedata"
+
+2. The S3 folders are partitioned like this:
+   data/gfolygruy/raw/recon/pp_sourcedata_archive/year=2026/month=05/day=31/
+
+3. The script should search partitions backward from START_DATE:
+   - First check year=YYYY/month=MM/day=DD for START_DATE
+   - If no valid files are found, check the previous day
+   - Continue backward up to LOOKBACK_DAYS
+   - It must handle month boundaries automatically, for example:
+     year=2026/month=05/day=01
+     then year=2026/month=04/day=30
+
+4. Important business logic:
+   - The S3 partition date is only the backup/load date.
+   - The actual business date is inside the filename.
+   - Example: inside year=2026/month=05/day=31, the files may contain business date 20260330.
+   - The script should list files inside each S3 partition and extract the latest business date from filenames.
+   - Supported business date patterns in filenames:
+     20260330
+     2026-03-30
+     2026_03_30
+     2026.03.30
+
+5. After finding the latest business date in the selected partition:
+   - Download only files matching that business date.
+   - For example, if latest business date is 2026-03-30, match all of these forms:
+     20260330
+     2026-03-30
+     2026_03_30
+     2026.03.30
+
+6. Laptop download location:
+   - Download files to:
+     /tmp/nr51159_s3_stage/business_date=YYYY-MM-DD/
+
+7. UAT transfer:
+   - Create the UAT target directory:
+     /tmp/nr51159/business_date=YYYY-MM-DD/
+   - Copy downloaded files from laptop to UAT using scp:
+     scp local_files user@host:/tmp/nr51159/business_date=YYYY-MM-DD/
+   - Validate with ssh and ls -lh.
+
+8. Add logging:
+   - Create log directory:
+     /tmp/nr51159_s3_stage/logs/
+   - Log file should be:
+     download_YYYYMMDD_HHMMSS.log
+   - Use tee so output goes to console and log file.
+
+9. Add validation:
+   - Check aws CLI exists.
+   - Check ssh exists.
+   - Check scp exists.
+   - Validate BUCKET is not the placeholder.
+   - Validate UAT_USER is not the placeholder.
+   - Validate UAT_HOST is not the placeholder.
+
+10. Make the script modular with functions in this order:
+    - validate_prerequisites
+    - date_minus_days
+    - extract_year
+    - extract_month
+    - extract_day
+    - find_latest_business_files
+    - download_files_to_laptop
+    - copy_files_to_uat
+    - validate_uat_files
+    - cleanup_temp_files
+    - main
+
+11. Use:
+    set -e
+    set -o pipefail
+
+12. Use AWS CLI command format:
+    aws s3 ls "s3://$BUCKET/$PARTITION_PREFIX" --recursive --endpoint-url "$ENDPOINT"
+
+13. Use this logic to list S3 object keys:
+    aws s3 ls "s3://$BUCKET/$PARTITION_PREFIX" \
+      --recursive \
+      --endpoint-url "$ENDPOINT" \
+      | awk '{print $4}' > "$TMP_FILE_LIST"
+
+14. Use grep/sed/sort logic to extract latest business date:
+    grep -Eo '20[0-9]{2}[-_.]?[0-9]{2}[-_.]?[0-9]{2}'
+    sed -E 's/[-_.]//g'
+    sed -E 's/(....)(..)(..)/\1-\2-\3/'
+    sort -u
+    sort
+    tail -1
+
+15. Make the script Mac-compatible:
+    - If gdate exists, use gdate.
+    - Otherwise use date -d.
+    - Implement helper functions so date handling is isolated.
+
+16. At the end, print a summary:
+    - Backup partition date used
+    - Business date downloaded
+    - Laptop staging path
+    - UAT target path
+    - Log file path
+
+17. Include clear echo messages for every major step.
+
+Please generate the complete Bash script only, with comments, ready to save as download_latest_business_files_to_uat.sh.
