@@ -1,0 +1,23 @@
+@workspace
+
+Recon 9356031 is still producing 0 matches and only breaks after the key-exclusion change.
+
+Add temporary INFO logs in the actual one-one runtime path to print:
+
+1. Left input count after transforms
+2. Right input count after transforms
+3. Final join key columns used by EZ
+4. Tolerance columns excluded from EZ key
+5. 10 sample left composite keys
+6. 10 sample right composite keys
+7. Join candidate count before tolerance predicate
+8. Join candidate count after tolerance predicate
+
+Do not change business logic. Only add logs.
+
+Goal:
+Find whether records drop to zero at:
+- key construction
+- join candidate creation
+- tolerance predicate
+- post-join classification
