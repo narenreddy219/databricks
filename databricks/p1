@@ -1,64 +1,13 @@
-The SQL-to-engine flow code has already been implemented in this codebase. I do not want to rewrite it.
+In the first half of the year, I worked mainly on the Global Reconciliation project, supporting Spark reconciliation debugging, data validation, break analysis, and production support activities.
 
-Please inspect the existing code and help me verify the completed implementation for Part 1.
+For Risk & Control, I focused on making sure reconciliation results were reviewed carefully before treating them as actual business breaks. I checked record counts, input files, schema mapping, pass keys, duplicate handling, and output breaks during issue analysis. This helped me understand whether a break was caused by real data differences or by configuration, parsing, or job-related issues.
 
-Context:
-Srajan generates a SQL query. The existing code should take raw input/feed files, create Spark DataFrames/temp views, execute the SQL, generate a transformed output file, and make that file ready for the reconciliation engine.
+For the Technology Manifesto / Client & Franchise goal, I worked on improving the quality of my technical analysis. One example was debugging a same-file reconciliation issue where the files were expected to match, but the job still produced a high number of breaks. I reviewed the Spark logs and learned that issues such as incorrect input parsing, missing schema columns, invalid pass keys, and duplicate handling can impact the final reconciliation output.
 
-I need you to trace the existing implementation and explain exactly how it works.
+I also supported production-related troubleshooting by reviewing logs, checking configuration files, validating file paths, and following up on issues. This helped me become more comfortable with the Global Reconciliation flow and the way Spark jobs generate reconciliation results.
 
-Please identify the exact classes, methods, and config properties involved in this flow:
+My main accomplishments were improving my understanding of the reconciliation process, becoming better at Spark job debugging, supporting validation activities, and learning how to connect technical issues with reconciliation outcomes.
 
-1. Where input/feed files are read from config
-2. Where input files are converted into Spark DataFrames
-3. Where temp views are created
-4. How temp view names are derived from file names
-5. Where lookup files are loaded
-6. Where lookup temp views are created
-7. Where the SQL query is read from
-8. Where spark.sql or equivalent SQL execution happens
-9. Where the transformed DataFrame is created
-10. Where the transformed output file is written
-11. Where the output file is handed off to the engine or made available for engine consumption
+One challenge was that some issues required deeper analysis because the final break count did not always show the real root cause. I am continuing to improve my ability to identify problems earlier and communicate risks or blockers more clearly.
 
-Please search for these keywords:
-- spark.sql
-- createOrReplaceTempView
-- createTempView
-- Dataset<Row>
-- DataFrame
-- loadLookup
-- loadLookups
-- lookup
-- application-local.properties
-- sql
-- query
-- transformation
-- output
-- write
-
-I need a clear mapping like this:
-
-| Step | Existing class/method | What it does | Config/property used |
-|---|---|---|---|
-| Load input files |  |  |  |
-| Create temp views |  |  |  |
-| Load lookup files |  |  |  |
-| Read SQL |  |  |  |
-| Execute SQL |  |  |  |
-| Write output |  |  |  |
-
-Also check if the implementation supports a baseline test SQL like:
-
-SELECT * FROM left_feed
-
-Please tell me:
-1. What local files/folders I need
-2. What config values I need in application-local.properties
-3. What command or main class I should run
-4. What logs/output I should expect
-5. What could fail if view names do not match SQL table names
-6. Whether any part is hard-coded
-7. Whether the implementation is ready for Srajan’s generated SQL
-
-Do not generate new code unless something is missing. First explain the existing flow and only recommend fixes if needed.
+For the rest of the year, I want to take more end-to-end ownership of Global Reconciliation work, improve my debugging speed, strengthen my data validation approach, and continue building deeper knowledge of the platform and business rules.
