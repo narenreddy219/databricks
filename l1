@@ -1,39 +1,113 @@
-from pyspark.sql.functions import current_timestamp, lit
+I need to understand and document the **complete functional flow of the Core Pre-Processor (CPP)** module in our reconciliation platform.
 
-# Config
-file_path = "s3://your-bucket/landing-zone/edm_entity1.csv"
-target_table = "default.temp_ingest_test"
+Analyze the existing Core Pre-Processor code, configuration files, classes, methods, SQL, and processing logic and derive the functional flow from the implementation.
 
-# Detect file format
-file_format = file_path.split('.')[-1].lower()
+The goal is NOT to explain the code class-by-class. The goal is to convert the implementation into a clear **functional process flow** that explains what happens to reconciliation data from the moment CPP receives it until CPP finishes processing and hands it to the next component.
 
-# Read options
-options = {
-    "cloudFiles.format": file_format,
-    "cloudFiles.inferColumnTypes": "true",
-    "cloudFiles.schemaLocation": "/tmp/autoloader/test_table/schema"
-}
+Start from the **CPP entry point** and trace the complete execution path.
 
-# Format-specific tweaks
-if file_format == "csv":
-    options.update({"header": "true", "delimiter": ","})
-elif file_format == "txt":
-    options.update({"header": "true", "delimiter": "\t"})
+For each step identify:
 
-# Load file with Auto Loader
-df = (
-    spark.read
-    .format("cloudFiles")
-    .options(**options)
-    .load(file_path)
-    .withColumn("source_file", lit(file_path))
-    .withColumn("load_timestamp", current_timestamp())
-)
+**Input → Validation/Decision → Processing/Transformation → Output → Next Step**
 
-# Write to Delta table (non-Unity Catalog)
-df.write.format("delta") \
-    .mode("append") \
-    .option("mergeSchema", "true") \
-    .saveAsTable(target_table)
+Specifically determine:
 
-print(f"✅ File loaded into Delta table: {target_table}")
+1. **How CPP is triggered**
+   - What component/process invokes CPP?
+   - What parameters or metadata are passed?
+   - What is the starting class/method?
+
+2. **Input identification**
+   - Where does CPP obtain its input data?
+   - How does it identify recon ID, COB date, feed/side, file/path/table, or other processing metadata?
+   - What configuration or metadata tables are read?
+
+3. **Initial validation**
+   - What validations happen before processing?
+   - What happens when input is missing, empty, invalid, or already processed?
+
+4. **Data loading**
+   - How is the input dataset loaded?
+   - Identify important decisions made while loading the data.
+
+5. **Core processing**
+   Trace the actual sequence of transformations performed by CPP.
+
+   For every transformation explain:
+   - Why it happens functionally.
+   - Input data.
+   - Columns/records affected.
+   - Configuration controlling it.
+   - Output produced.
+   - What happens next.
+
+6. **Decision points**
+   Identify all important IF/ELSE or configuration-driven branches.
+
+   Represent them as business questions such as:
+
+   **Is the input available?**
+   **Is this transformation configured?**
+   **Is the dataset empty?**
+   **Did validation succeed?**
+   **Should processing continue or fail?**
+
+7. **Intermediate datasets**
+   Show how the dataset changes through CPP.
+
+   Example structure:
+
+   Raw/Merged Input  
+   ↓  
+   Initial Validation  
+   ↓  
+   Standardization  
+   ↓  
+   Common Transformations  
+   ↓  
+   Derived/Calculated Fields  
+   ↓  
+   Filtering/Validation  
+   ↓  
+   Final CPP Dataset
+
+   Do NOT assume these exact steps exist. Replace them with the actual steps found in the code.
+
+8. **Audit and status handling**
+   - Where does CPP update processing status?
+   - What statuses are written during STARTED / SUCCESS / FAILED processing?
+   - What record counts, timestamps, messages, recon ID, COB date, or component information are captured?
+
+9. **Error handling and retry**
+   - What happens if a transformation fails?
+   - What happens if input data is unavailable?
+   - Does CPP stop, retry, skip, or mark the reconciliation as failed?
+   - Identify exception-handling paths.
+
+10. **CPP completion**
+   - What exactly indicates successful completion?
+   - Where is the processed dataset written?
+   - What metadata/status is updated?
+   - What component consumes CPP output next?
+
+Finally create a **Mermaid functional flowchart**.
+
+The diagram should show the actual CPP processing sequence with:
+
+- Start/End nodes
+- Processing steps as rectangles
+- Decision points as diamonds
+- YES/NO branches
+- Failure paths
+- Audit/status updates
+- Input and output
+- Retry/skip paths where applicable
+
+Keep the diagram at **functional level**, not class/method level.
+
+After the diagram, provide a mapping table:
+
+| Functional Step | What It Does | Input | Output | Code/Class/Method | Configuration/Metadata |
+|---|---|---|---|---|---|
+
+Important: **Do not invent processing steps. Derive every step from the existing CPP implementation. If something cannot be determined from the code, mark it as “Needs Confirmation.”**
